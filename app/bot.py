@@ -37,8 +37,6 @@ logging.basicConfig(
 )
 log = logging.getLogger("bot")
 
-MAX_RESULTS = 20
-
 _INGEST_SEM = None
 
 
@@ -82,9 +80,11 @@ async def _ingest_job(bot, chat_id, target, province_label, tmp_path):
 # DB query helpers — same logic style as app/api.py, but direct (no HTTP).
 # ---------------------------------------------------------------------------
 try:
-    from sqlalchemy import select
+    from sqlalchemy import select, case, func
 except ImportError:  # pragma: no cover - sqlalchemy is a hard dep of db.py
-    select = None
+    select = case = func = None
+
+PAGE_SIZE = 8   # results shown per page in name-search (paginated, not capped)
 
 
 def lookup_exam_no(exam_no: str):
@@ -97,21 +97,40 @@ def lookup_exam_no(exam_no: str):
         return st.to_dict() if st else None
 
 
-def search_by_name(name: str, province: str | None = None):
-    """normalize_ar + AND of LIKE %token% on name_norm, capped at MAX_RESULTS."""
+def search_by_name(name: str, province: str | None = None,
+                   offset: int = 0, limit: int = PAGE_SIZE):
+    """normalize_ar + AND of LIKE %token% on name_norm, RANKED so the closest
+    matches come first (whole typed phrase before scattered tokens), and
+    PAGINATED (offset/limit) instead of hard-capped.
+
+    Returns (results, total) — total is the full match count across all pages.
+    """
     norm = normalize_ar(name or "")
     tokens = [t for t in norm.split() if t]
     if not tokens:
-        return []
+        return [], 0
+    phrase = " ".join(tokens)
     with SessionLocal() as db:
-        stmt = select(Student)
+        base = select(Student)
         for t in tokens:
-            stmt = stmt.where(Student.name_norm.like(f"%{t}%"))
+            base = base.where(Student.name_norm.like(f"%{t}%"))
         if province:
-            stmt = stmt.where(Student.province_code == province)
-        stmt = stmt.order_by(Student.name).limit(MAX_RESULTS)
-        rows = db.execute(stmt).scalars().all()
-        return [s.to_dict() for s in rows]
+            base = base.where(Student.province_code == province)
+        total = db.execute(
+            select(func.count()).select_from(base.subquery())
+        ).scalar() or 0
+        # Relevance: exact phrase, then phrase-prefix, then phrase-substring,
+        # then the rest — each tier alphabetized.
+        rank = case(
+            (Student.name_norm == phrase, 0),
+            (Student.name_norm.like(f"{phrase}%"), 1),
+            (Student.name_norm.like(f"%{phrase}%"), 2),
+            else_=3,
+        )
+        rows = db.execute(
+            base.order_by(rank, Student.name).offset(offset).limit(limit)
+        ).scalars().all()
+        return [s.to_dict() for s in rows], total
 
 
 def list_provinces():
@@ -191,6 +210,8 @@ WELCOME = (
 # conversation state keys stored in context.user_data
 MODE_NAME = "awaiting_name"
 SELECTED_PROVINCE = "province"
+SEARCH_Q = "search_q"        # last name query, for page navigation
+SEARCH_PROV = "search_prov"  # province the last search was scoped to (or None)
 
 
 def build_application(token: str):
@@ -278,6 +299,68 @@ def build_application(token: str):
         else:
             await query.message.reply_text("لم يتم العثور على النتيجة.")
 
+    def _results_keyboard(results, offset, total):
+        """One two-line button per result (name + 🗺️ province), then a nav row
+        (⬅️ السابق / صفحة X/Y / التالي ➡️) when there is more than one page."""
+        buttons = []
+        for d in results:
+            name = d.get("name") or d.get("exam_no")
+            prov_name = (d.get("school") or {}).get("province") or "—"
+            # a newline inside button text renders as a second line in Telegram
+            label = f"{name}\n🗺️ {prov_name}"
+            buttons.append(
+                [InlineKeyboardButton(label[:120], callback_data=f"res:{d['exam_no']}")]
+            )
+        pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
+        cur = offset // PAGE_SIZE + 1
+        if pages > 1:
+            nav = []
+            if offset > 0:
+                nav.append(InlineKeyboardButton(
+                    "⬅️ السابق", callback_data=f"pg:{max(0, offset - PAGE_SIZE)}"))
+            nav.append(InlineKeyboardButton(f"صفحة {cur}/{pages}", callback_data="noop"))
+            if offset + PAGE_SIZE < total:
+                nav.append(InlineKeyboardButton(
+                    "التالي ➡️", callback_data=f"pg:{offset + PAGE_SIZE}"))
+            buttons.append(nav)
+        return InlineKeyboardMarkup(buttons)
+
+    async def send_results_page(message, context, q, prov, offset):
+        """Run the paginated search and render one page. A single exact hit is
+        shown as a full card; otherwise a paginated pick-list."""
+        context.user_data[SEARCH_Q] = q
+        context.user_data[SEARCH_PROV] = prov
+        results, total = search_by_name(q, province=prov, offset=offset, limit=PAGE_SIZE)
+        if total == 0:
+            await message.reply_text(
+                "❌ لم يتم العثور على نتائج بهذا الاسم. جرّب /start مرة أخرى.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        if total == 1 and results:
+            await message.reply_text(format_card(results[0]), parse_mode=ParseMode.HTML)
+            return
+        await message.reply_text(
+            f"🔎 وجدت {total} نتيجة — اختر الاسم:",
+            reply_markup=_results_keyboard(results, offset, total),
+        )
+
+    async def on_page(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        query = update.callback_query
+        await query.answer()
+        if (query.data or "") == "noop":
+            return
+        try:
+            offset = int((query.data or "pg:0").split("pg:", 1)[1])
+        except ValueError:
+            offset = 0
+        q = context.user_data.get(SEARCH_Q)
+        if not q:
+            await query.message.reply_text("انتهت الجلسة. استخدم /start للبحث من جديد.")
+            return
+        prov = context.user_data.get(SEARCH_PROV)
+        await send_results_page(query.message, context, q, prov, offset)
+
     async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = (update.effective_message.text or "").strip()
         if not text:
@@ -301,51 +384,20 @@ def build_application(token: str):
         # Name-search mode.
         if context.user_data.get(MODE_NAME):
             province = context.user_data.get(SELECTED_PROVINCE)
-            results = search_by_name(text, province=province)
             context.user_data.pop(MODE_NAME, None)
-            if not results:
-                await update.effective_message.reply_text(
-                    "❌ لم يتم العثور على نتائج بهذا الاسم. جرّب /start مرة أخرى.",
-                    parse_mode=ParseMode.HTML,
-                )
-                return
-            if len(results) == 1:
-                await update.effective_message.reply_text(
-                    format_card(results[0]), parse_mode=ParseMode.HTML
-                )
-                return
-            buttons = []
-            for d in results:
-                school = (d.get("school") or {}).get("name") or ""
-                label = d.get("name") or d.get("exam_no")
-                if school:
-                    label = f"{label} — {school}"
-                buttons.append(
-                    [InlineKeyboardButton(label[:60], callback_data=f"res:{d['exam_no']}")]
-                )
-            await update.effective_message.reply_text(
-                f"🔎 وجدت {len(results)} نتيجة. اختر الاسم:",
-                reply_markup=InlineKeyboardMarkup(buttons),
-            )
+            await send_results_page(update.effective_message, context,
+                                    text, province, 0)
             return
 
         # Fallback: treat any other input as a name search across all provinces.
-        results = search_by_name(text)
-        if not results:
+        _, total = search_by_name(text, offset=0, limit=1)
+        if total == 0:
             await update.effective_message.reply_text(
                 "لم أفهم طلبك. استخدم /start للبدء، أو أرسل رقمك الامتحاني.",
                 parse_mode=ParseMode.HTML,
             )
             return
-        buttons = [
-            [InlineKeyboardButton((d.get("name") or d["exam_no"])[:60],
-                                  callback_data=f"res:{d['exam_no']}")]
-            for d in results
-        ]
-        await update.effective_message.reply_text(
-            f"🔎 وجدت {len(results)} نتيجة. اختر الاسم:",
-            reply_markup=InlineKeyboardMarkup(buttons),
-        )
+        await send_results_page(update.effective_message, context, text, None, 0)
 
     async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user = update.effective_user
@@ -434,6 +486,7 @@ def build_application(token: str):
     application.add_handler(CallbackQueryHandler(on_menu, pattern=r"^mode:"))
     application.add_handler(CallbackQueryHandler(on_province, pattern=r"^prov:"))
     application.add_handler(CallbackQueryHandler(on_result_pick, pattern=r"^res:"))
+    application.add_handler(CallbackQueryHandler(on_page, pattern=r"^(pg:|noop$)"))
     application.add_handler(MessageHandler(filters.Document.ALL, on_document))
     application.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, on_text)

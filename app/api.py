@@ -18,7 +18,7 @@ from fastapi import FastAPI, Depends, HTTPException, Query, UploadFile, File, Fo
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from sqlalchemy import select, func
+from sqlalchemy import select, func, case
 from sqlalchemy.orm import Session
 
 try:
@@ -173,6 +173,7 @@ def search(
     if name and name.strip():
         norm = normalize_ar(name)
         tokens = [t for t in norm.split() if t]
+        phrase = " ".join(tokens)
         stmt = select(Student)
         for t in tokens:
             stmt = stmt.where(Student.name_norm.like(f"%{t}%"))
@@ -180,7 +181,15 @@ def search(
             stmt = stmt.where(Student.province_code == province)
         if school:
             stmt = stmt.where(Student.school_code == school)
-        stmt = stmt.order_by(Student.name).limit(MAX_RESULTS)
+        # Rank the closest matches first: exact typed phrase, then phrase-prefix,
+        # then phrase-substring, then the rest — each tier alphabetized.
+        rank = case(
+            (Student.name_norm == phrase, 0),
+            (Student.name_norm.like(f"{phrase}%"), 1),
+            (Student.name_norm.like(f"%{phrase}%"), 2),
+            else_=3,
+        )
+        stmt = stmt.order_by(rank, Student.name).limit(MAX_RESULTS)
         rows = db.execute(stmt).scalars().all()
         results = [s.to_dict() for s in rows]
         return cached_json({"count": len(results), "results": results})
