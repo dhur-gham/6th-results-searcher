@@ -14,7 +14,7 @@ normalized Arabic.
 ```
   Ministry PDFs                          reads (immutable, cacheable)
   (embedded glyph  ─▶  parser  ─▶  SQLite / Postgres  ─┬─▶  FastAPI  ─▶  web (static)
-   font, visual        (glyph-      (Student,          │     (app/api.py)   (web/, Vercel)
+   font, visual        (glyph-      (Student,          │     (app/api.py)   (web/, via Caddy)
    order Arabic)        decoded)     School, Province) │
                                                        └─▶  Telegram bot (app/bot.py)
                                                              direct SessionLocal — no HTTP hop
@@ -121,14 +121,32 @@ features you want.
 
 ## Deployment
 
-A cheap, burst-proof split:
+Production is a **single-VPS Docker stack** — everything is in
+`docker-compose.prod.yml` and comes up with one command. Full step-by-step guide
+(domain, Cloudflare, `.env`, ingest, backups): **[`deploy/DEPLOY.md`](deploy/DEPLOY.md)**.
 
-- **Postgres:** [Supabase](https://supabase.com) — set `DATABASE_URL` to its `postgresql+psycopg://...` connection string. Ingest once; results are immutable.
-- **API + bot:** [Railway](https://railway.app) (or Fly/Render/any container host) from this repo's `Dockerfile`. Run two services from the same image: API uses the default `CMD`; the bot overrides it with `python -m app.bot`. Set `DATABASE_URL`, `TELEGRAM_TOKEN`, `ADMIN_IDS`, `ADMIN_TOKEN`.
-- **Web frontend:** [Vercel](https://vercel.com) serves `web/` statically (`vercel.json` sets `outputDirectory: web`). Point it at the API by defining `window.API_BASE` — add a tiny inline script in `web/index.html`, e.g. `<script>window.API_BASE="https://your-api.up.railway.app"</script>` (the frontend reads `window.API_BASE`, falling back to same-origin).
-- **Cloudflare** in front of the API caches the `Cache-Control: public, max-age=3600` GET responses, so result-day traffic is served from edge, not origin.
+```
+Cloudflare (free CDN)  ->  Caddy :443 (auto-TLS)  ->  API (gunicorn ×8)  ->  Postgres
+                                                   ->  Telegram bot      ->  Postgres
+                                                   telegram-bot-api (2 GB uploads)
+                                                   backup -> nightly pg_dump
+```
 
-Locally, `docker compose up` reproduces api + bot; add `--profile pg` to also
-start a Postgres container (set `DATABASE_URL` in `.env` accordingly). To test big
-Telegram uploads on your PC, use `docker compose -f docker-compose.local.yml up
---build`, which adds the local Bot API server (SQLite, no Postgres).
+- **One host, one command:** `docker compose -f docker-compose.prod.yml up -d --build`
+  brings up Postgres + API + bot + `telegram-bot-api` + Caddy + nightly backup.
+  Tested on a Contabo VPS (4 vCPU / 8 GB / 100 GB SSD).
+- **Postgres** holds the immutable results (`DATABASE_URL=postgresql+psycopg://...`).
+  Ingest once; on Postgres you can raise `INGEST_CONCURRENCY` for parallel bot ingest.
+- **Caddy** terminates TLS automatically for `DOMAIN` and reverse-proxies the API +
+  the static `web/` frontend (same origin — no `window.API_BASE` needed).
+- **Cloudflare** (free) in front caches the `Cache-Control: public, max-age=CACHE_MAX_AGE`
+  GET responses (set `CACHE_MODE=prod` once all cities are loaded), so result-day
+  traffic is served from the edge, not the origin.
+- **Big uploads:** the bundled `telegram-bot-api` service lifts the bot's 20 MB
+  download cap to 2 GB (see [`deploy/DEPLOY.md`](deploy/DEPLOY.md) §2b).
+
+### Local Docker
+
+- `docker compose up` — api (`:8000`) + bot on SQLite, no config.
+- `docker compose -f docker-compose.local.yml up --build` — adds the local Bot API
+  server so you can test full-province `.rar` uploads on your PC (SQLite, no Postgres).
