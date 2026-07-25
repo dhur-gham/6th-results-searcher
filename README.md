@@ -33,7 +33,8 @@ absorbs the result-announcement-day burst with near-zero origin load.
 | `app/parse_pdf.py` | Parse one school PDF -> student rows |
 | `app/ingest.py` | Ingest a folder, `.zip`, or `.rar` into the DB (idempotent upsert; PDF parsing parallelized across cores) |
 | `app/db.py` | SQLAlchemy models; SQLite default, Postgres via `DATABASE_URL` |
-| `app/api.py` | FastAPI: `/api/provinces`, `/api/schools`, `/api/search`, `POST /api/ingest`, `POST /api/reset`; serves `web/` |
+| `app/api.py` | FastAPI: `/api/provinces`, `/api/schools`, `/api/search`, `/api/stats`, `POST /api/ingest`, `POST /api/reset`; serves `web/` |
+| `app/analytics.py` | Pure analytics: per-province counters -> merged overall + per-subject/per-city metrics |
 | `app/bot.py` | Telegram bot; queries the DB directly (same process, no HTTP) |
 | `web/` | Static frontend (province -> school -> search) |
 
@@ -82,6 +83,9 @@ Brings up `api` (port 8000) + `bot` on SQLite with no configuration. Add a
 - Send a long digit string any time -> auto-detected as an **exam number**; replies with a formatted Arabic result card (name, school/track/province, ناجح/معيد, المعدل, المجموع, subject grades). Null average/total (معيد) is handled gracefully.
 - **Name search**: pick a province (or "كل المحافظات"), then send the name. Matching uses `normalize_ar` + AND of `LIKE %token%` on `name_norm`, capped at 20 results; tap a result to see its full card.
 - **Admin ingest**: a user whose id is in `ADMIN_IDS` can send a `.zip`/`.rar` document; the bot queues it as a background job and calls `ingest_path`, replying with stats when done. Multiple uploads run concurrently (bounded by `INGEST_CONCURRENCY`). If `ADMIN_IDS` is unset, bot ingest is disabled.
+- **Statistics** (`/stats`): overall totals (provinces, schools, students, pass
+  rate, mean average) + per-subject pass rates, with inline buttons to drill into
+  any province's full per-subject breakdown. Public. Backed by `GET /api/stats`.
 - **Reset for a new stage** (`/reset`): an admin can wipe **all** data (provinces,
   schools, students) to start fresh — e.g. before loading الدور الثاني results. It
   shows current totals and requires a confirm tap; the action is irreversible. Same

@@ -21,8 +21,10 @@ app/
   db.py          SQLAlchemy models. SQLite default, Postgres via DATABASE_URL.
   ingest.py      province folder/zip/rar -> DB (idempotent upsert; parallel PDF parse
                  + bulk upsert). CLI: python -m app.ingest
-  api.py         FastAPI: /api/provinces, /api/schools, /api/search, POST /api/ingest,
-                 POST /api/reset (wipe-all for a new stage). Serves web/.
+  analytics.py   Pure aggregation: per-province counters -> merged overall +
+                 per-subject/per-city metrics. Counters stored raw so they merge exactly.
+  api.py         FastAPI: /api/provinces, /api/schools, /api/search, /api/stats,
+                 POST /api/ingest, POST /api/reset (wipe-all for a new stage). Serves web/.
   bot.py         Telegram bot. Queries DB directly. Self-disables without TELEGRAM_TOKEN.
                  Admin ingest runs as a background job; optional local Bot API server.
 web/             Static RTL Arabic SPA (index.html + styles.css + app.js). No build step.

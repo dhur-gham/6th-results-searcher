@@ -68,6 +68,16 @@ class School(Base):
     students: Mapped[list["Student"]] = relationship(back_populates="school")
 
 
+class ProvinceStats(Base):
+    """Precomputed analytics counters for one province (see app/analytics.py).
+    Stored as raw counters JSON so the overall/per-subject totals merge exactly.
+    Written at ingest time; overall is derived by merging all rows on read."""
+    __tablename__ = "province_stats"
+    province_code: Mapped[str] = mapped_column(String(8), primary_key=True)
+    name: Mapped[str] = mapped_column(String(64))
+    data_json: Mapped[str] = mapped_column(Text, default="{}")
+
+
 class Student(Base):
     __tablename__ = "students"
     exam_no: Mapped[str] = mapped_column(String(24), primary_key=True)
@@ -131,12 +141,72 @@ def reset_all():
         db.execute(delete(Student))
         db.execute(delete(School))
         db.execute(delete(Province))
+        db.execute(delete(ProvinceStats))
         db.commit()
     # reclaim space on SQLite (no-op-ish on Postgres autovacuum)
     if DATABASE_URL.startswith("sqlite"):
         with engine.connect() as conn:
             conn.exec_driver_sql("VACUUM")
     return counts
+
+
+# ---------------------------------------------------------------------------
+# Analytics persistence (counters live in province_stats; see app/analytics.py).
+# ---------------------------------------------------------------------------
+def save_province_stats(pcode, pname, counters):
+    """Upsert one province's analytics counters (idempotent, like ingest)."""
+    from sqlalchemy.dialects.sqlite import insert as _sqlite_insert
+    from sqlalchemy.dialects.postgresql import insert as _pg_insert
+    payload = {"province_code": pcode, "name": pname,
+               "data_json": json.dumps(counters, ensure_ascii=False)}
+    with SessionLocal() as db:
+        ins = _pg_insert if db.bind.dialect.name == "postgresql" else _sqlite_insert
+        stmt = ins(ProvinceStats).values(**payload)
+        stmt = stmt.on_conflict_do_update(
+            index_elements=["province_code"],
+            set_={"name": stmt.excluded.name, "data_json": stmt.excluded.data_json},
+        )
+        db.execute(stmt)
+        db.commit()
+
+
+def load_province_counters():
+    """[(code, name, counters_dict), ...] for every stored province."""
+    with SessionLocal() as db:
+        rows = db.execute(select(ProvinceStats)).scalars().all()
+        return [(r.province_code, r.name, json.loads(r.data_json or "{}")) for r in rows]
+
+
+def recompute_all_stats():
+    """Rebuild province_stats from the students table (backfill / repair).
+
+    Used once for data ingested before analytics existed, or to repair. Streams
+    students per province so memory stays flat even for the full country.
+    """
+    try:
+        from . import analytics
+    except ImportError:  # running as top-level module
+        import analytics
+    init_db()
+    with SessionLocal() as db:
+        provs = db.execute(select(Province)).scalars().all()
+        prov_list = [(p.code, p.name) for p in provs]
+    done = 0
+    for pcode, pname in prov_list:
+        c = analytics.blank()
+        schools = set()
+        with SessionLocal() as db:
+            q = db.execute(
+                select(Student).where(Student.province_code == pcode)
+                .execution_options(yield_per=2000)
+            )
+            for st in q.scalars():
+                analytics.accumulate(c, st.result, st.average, st.grades)
+                schools.add(st.school_code)
+        c["schools"] = len(schools)
+        save_province_stats(pcode, pname, c)
+        done += 1
+    return {"provinces": done}
 
 
 if __name__ == "__main__":

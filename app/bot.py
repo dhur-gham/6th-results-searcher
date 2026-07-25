@@ -23,13 +23,17 @@ import asyncio
 import logging
 
 try:
-    from .db import init_db, reset_all, SessionLocal, Province, School, Student
+    from .db import (init_db, reset_all, SessionLocal, Province, School, Student,
+                     load_province_counters)
     from .glyph import normalize_ar
     from .ingest import ingest_path
+    from . import analytics
 except ImportError:  # allow running as a top-level module too
-    from db import init_db, reset_all, SessionLocal, Province, School, Student
+    from db import (init_db, reset_all, SessionLocal, Province, School, Student,
+                    load_province_counters)
     from glyph import normalize_ar
     from ingest import ingest_path
+    import analytics
 
 logging.basicConfig(
     level=logging.INFO,
@@ -193,6 +197,51 @@ def format_card(d: dict) -> str:
         for subject, grade in grades.items():
             lines.append(f"{SUBJECT_EMOJI} {_esc(subject)}: <b>{_esc(grade)}</b>")
 
+    return "\n".join(lines)
+
+
+def _fmt_overall(derived, provinces_count):
+    d = derived
+    lines = [
+        "📊 <b>إحصائيات عامة</b>",
+        f"المحافظات: <b>{provinces_count}</b> · المدارس: <b>{d['schools']}</b> · "
+        f"الطلاب: <b>{d['students']}</b>",
+        f"✅ ناجح: <b>{d['passed']}</b> · 🔁 معيد: <b>{d['failed']}</b> · "
+        f"نسبة النجاح: <b>{d['pass_rate']}%</b>",
+    ]
+    if d["avg_of_averages"] is not None:
+        lines.append(f"📈 معدل المعدلات: <b>{d['avg_of_averages']}</b>")
+    subs = list(d["subjects"].items())
+    if subs:
+        lines.append("\n<b>المواد (الأعلى نجاحًا):</b>")
+        for subj, s in subs[:5]:
+            lines.append(f"📘 {_esc(subj)}: {s['pass_rate']}% "
+                         f"(معدل {s['avg'] if s['avg'] is not None else '—'})")
+        if len(subs) > 5:
+            lines.append("<b>الأدنى نجاحًا:</b>")
+            for subj, s in subs[-3:]:
+                lines.append(f"📕 {_esc(subj)}: {s['pass_rate']}% "
+                             f"(معدل {s['avg'] if s['avg'] is not None else '—'})")
+    return "\n".join(lines)
+
+
+def _fmt_province(name, derived):
+    d = derived
+    lines = [
+        f"📊 <b>{_esc(name)}</b>",
+        f"المدارس: <b>{d['schools']}</b> · الطلاب: <b>{d['students']}</b>",
+        f"✅ ناجح: <b>{d['passed']}</b> · 🔁 معيد: <b>{d['failed']}</b> · "
+        f"نسبة النجاح: <b>{d['pass_rate']}%</b>",
+    ]
+    if d["avg_of_averages"] is not None:
+        lines.append(f"📈 معدل المعدلات: <b>{d['avg_of_averages']}</b>")
+    if d["subjects"]:
+        lines.append("\n<b>حسب المادة:</b>")
+        for subj, s in d["subjects"].items():
+            avg = s["avg"] if s["avg"] is not None else "—"
+            lines.append(
+                f"📘 {_esc(subj)}: نجاح {s['pass_rate']}% · معدل {avg} · "
+                f"غائب {s['absent']}")
     return "\n".join(lines)
 
 
@@ -479,6 +528,45 @@ def build_application(token: str):
         await update.effective_message.reply_text(
             f"📥 «{province_label}» أُضيفت للمعالجة في الخلفية.")
 
+    def _load_analytics():
+        """[(code, name, counters), ...] -> overall + per-province derived."""
+        counters = load_province_counters()
+        overall = analytics.merge_all([c for (_c, _n, c) in counters])
+        return counters, overall
+
+    async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        counters, overall = _load_analytics()
+        if not counters or overall["students"] == 0:
+            await update.effective_message.reply_text(
+                "لا توجد بيانات بعد. أرسل نتائج المحافظات أولًا.")
+            return
+        # per-province drill-down buttons (2 per row)
+        provs = sorted(counters, key=lambda t: analytics.derive(t[2])["pass_rate"],
+                       reverse=True)
+        buttons, row = [], []
+        for (code, name, _c) in provs:
+            row.append(InlineKeyboardButton(name, callback_data=f"stats:{code}"))
+            if len(row) == 2:
+                buttons.append(row); row = []
+        if row:
+            buttons.append(row)
+        await update.effective_message.reply_text(
+            _fmt_overall(analytics.derive(overall), len(counters)),
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(buttons) if buttons else None)
+
+    async def on_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        query = update.callback_query
+        await query.answer()
+        code = (query.data or "stats:").split("stats:", 1)[1]
+        for (c, name, cnt) in load_province_counters():
+            if c == code:
+                await query.message.reply_text(
+                    _fmt_province(name, analytics.derive(cnt)),
+                    parse_mode=ParseMode.HTML)
+                return
+        await query.message.reply_text("لا توجد إحصائيات لهذه المحافظة.")
+
     async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Admin: wipe ALL data to start a fresh stage. Two-step confirm."""
         user = update.effective_user
@@ -541,6 +629,8 @@ def build_application(token: str):
     application.add_handler(CommandHandler("help", cmd_help))
     application.add_handler(CommandHandler("reset", cmd_reset))
     application.add_handler(CallbackQueryHandler(on_reset, pattern=r"^reset:"))
+    application.add_handler(CommandHandler("stats", cmd_stats))
+    application.add_handler(CallbackQueryHandler(on_stats, pattern=r"^stats:"))
     application.add_handler(CallbackQueryHandler(on_menu, pattern=r"^mode:"))
     application.add_handler(CallbackQueryHandler(on_province, pattern=r"^prov:"))
     application.add_handler(CallbackQueryHandler(on_result_pick, pattern=r"^res:"))

@@ -23,11 +23,13 @@ import argparse
 try:
     from .parse_pdf import parse_pdf
     from .glyph import normalize_ar
-    from .db import init_db, SessionLocal, Province, School, Student
+    from .db import init_db, SessionLocal, Province, School, Student, save_province_stats
+    from . import analytics
 except ImportError:
     from parse_pdf import parse_pdf
     from glyph import normalize_ar
-    from db import init_db, SessionLocal, Province, School, Student
+    from db import init_db, SessionLocal, Province, School, Student, save_province_stats
+    import analytics
 
 SCHOOL_RE = re.compile(r"^(\d+)[_\-\s]+(.+?)\.pdf$", re.IGNORECASE)
 PROV_RE = re.compile(r"^(\d+)[_\-\s]+(.+)$")
@@ -200,6 +202,7 @@ def ingest_path(path, province_label=None, progress=None, workers=None):
 
         school_rows = {}   # scode -> dict
         student_rows = []  # list of dicts
+        counters = analytics.blank()   # analytics accumulated student-by-student
 
         def apply_result(res):
             scode, sname, track, rows, err = res
@@ -209,6 +212,7 @@ def ingest_path(path, province_label=None, progress=None, workers=None):
             school_rows[scode] = {"code": scode, "name": sname, "track": track,
                                    "province_code": pcode}
             for r in rows:
+                analytics.accumulate(counters, r["result"], r["average"], r["grades"])
                 student_rows.append({
                     "exam_no": r["exam_no"],
                     "name": r["name"],
@@ -245,6 +249,10 @@ def ingest_path(path, province_label=None, progress=None, workers=None):
                      ["name", "name_norm", "result", "total", "average",
                       "grades_json", "province_code", "school_code"])
         db.commit()
+
+    # Persist this province's analytics counters (overall is merged on read).
+    counters["schools"] = len(school_rows)
+    save_province_stats(pcode, pname, counters)
 
     if cleanup:
         import shutil

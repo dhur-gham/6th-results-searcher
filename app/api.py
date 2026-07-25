@@ -22,11 +22,15 @@ from sqlalchemy import select, func, case
 from sqlalchemy.orm import Session
 
 try:
-    from .db import init_db, reset_all, SessionLocal, Province, School, Student
+    from .db import (init_db, reset_all, SessionLocal, Province, School, Student,
+                     load_province_counters, recompute_all_stats)
     from .glyph import normalize_ar
     from .ingest import ingest_path
+    from . import analytics
 except ImportError:  # allow running as a top-level module too
-    from db import init_db, reset_all, SessionLocal, Province, School, Student
+    from db import (init_db, reset_all, SessionLocal, Province, School, Student,
+                    load_province_counters, recompute_all_stats)
+    import analytics
     from glyph import normalize_ar
     from ingest import ingest_path
 
@@ -80,6 +84,7 @@ def cached_json(payload):
 _provinces_cache = None
 _schools_cache = {}   # key -> list
 _student_cache = {}   # exam_no -> dict | None
+_stats_cache = {}     # province_code|"" -> payload
 
 
 def _clear_caches():
@@ -87,6 +92,7 @@ def _clear_caches():
     _provinces_cache = None
     _schools_cache.clear()
     _student_cache.clear()
+    _stats_cache.clear()
 
 
 @app.get("/api/provinces")
@@ -195,6 +201,71 @@ def search(
         return cached_json({"count": len(results), "results": results})
 
     raise HTTPException(status_code=400, detail="provide exam_no or name")
+
+
+def _analytics_payload(province=None):
+    """Build (and cache) analytics. Overall = merge of all province counters;
+    per-subject and per-city fall straight out of the stored counters."""
+    key = province or ""
+    if key in _stats_cache:
+        return _stats_cache[key]
+
+    counters = load_province_counters()
+    if not counters:
+        # backfill once for data ingested before analytics existed
+        with SessionLocal() as db:
+            has_students = db.execute(select(Student.exam_no).limit(1)).first()
+        if has_students:
+            recompute_all_stats()
+            counters = load_province_counters()
+
+    by_code = {c: (name, cnt) for (c, name, cnt) in counters}
+
+    if province is not None:
+        if province not in by_code:
+            raise HTTPException(status_code=404, detail="province not found")
+        name, cnt = by_code[province]
+        payload = {"scope": "province", "code": province, "name": name,
+                   **analytics.derive(cnt)}
+        _stats_cache[key] = payload
+        return payload
+
+    overall = analytics.merge_all([cnt for (_c, _n, cnt) in counters])
+    provinces_summary = []
+    for (c, name, cnt) in counters:
+        d = analytics.derive(cnt)
+        provinces_summary.append({
+            "code": c, "name": name,
+            "students": d["students"], "schools": d["schools"],
+            "passed": d["passed"], "failed": d["failed"],
+            "pass_rate": d["pass_rate"], "avg_of_averages": d["avg_of_averages"],
+        })
+    provinces_summary.sort(key=lambda x: x["pass_rate"], reverse=True)
+    payload = {
+        "scope": "overall",
+        "provinces_count": len(counters),
+        "overall": analytics.derive(overall),   # includes per-subject overall
+        "provinces": provinces_summary,          # per-city summary
+    }
+    _stats_cache[key] = payload
+    return payload
+
+
+@app.get("/api/stats")
+def stats(province: str | None = None):
+    """Analytics: overall totals + per-subject + per-province. Pass ?province=CODE
+    for one city's full breakdown (including its per-subject rows)."""
+    return cached_json(_analytics_payload(province))
+
+
+@app.post("/api/stats/recompute")
+def stats_recompute(authorization: str | None = Header(None)):
+    """Rebuild analytics from the students table. Admin-only (Bearer ADMIN_TOKEN)."""
+    if authorization != f"Bearer {ADMIN_TOKEN}":
+        raise HTTPException(status_code=401, detail="unauthorized")
+    res = recompute_all_stats()
+    _clear_caches()
+    return res
 
 
 @app.post("/api/ingest")
