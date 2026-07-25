@@ -217,6 +217,7 @@ select{appearance:none;padding-inline-start:40px}
   display:flex;align-items:center;justify-content:space-between;gap:12px;
   width:100%;text-align:start;cursor:pointer;
   font-family:inherit;
+  color:var(--text);            /* <button> doesn't inherit color -> would be black in dark mode */
   background:var(--surface);
   border:1px solid var(--border);
   border-radius:14px;
