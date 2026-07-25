@@ -7,7 +7,12 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 
-# System deps: none required beyond wheels (pymupdf/fonttools ship wheels).
+# System deps: RAR extractors for ministry .rar uploads. bsdtar (libarchive-tools)
+# handles RAR3/5 reliably; unar is a fallback.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libarchive-tools unar \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 

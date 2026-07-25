@@ -3,7 +3,7 @@ Ingest a province into the database.
 
 Accepts either:
   * a directory:  <province>/<track>/<code>_<schoolname>.pdf
-  * a .zip of that structure
+  * a .zip or .rar of that structure
 
 Province is taken from --province "26_واسط" (code_name) or the top folder name.
 Idempotent: re-ingesting upserts, never duplicates.
@@ -15,6 +15,7 @@ Usage:
 import os
 import re
 import sys
+import json
 import zipfile
 import tempfile
 import argparse
@@ -41,11 +42,78 @@ def parse_province(label: str):
     return label, label
 
 
-def _extract_zip(path):
+def is_archive(path):
+    return path.lower().endswith((".zip", ".rar"))
+
+
+# Common Windows install locations for a RAR backend (rarfile needs one of these
+# when they aren't on PATH). Linux/Docker uses `unar` installed via the Dockerfile.
+_WIN_UNRAR = [
+    r"C:\Program Files\WinRAR\UnRAR.exe",
+    r"C:\Program Files (x86)\WinRAR\UnRAR.exe",
+]
+_WIN_7ZIP = [
+    r"C:\Program Files\7-Zip\7z.exe",
+    r"C:\Program Files (x86)\7-Zip\7z.exe",
+]
+
+
+def _which_any(names):
+    import shutil
+    for n in names:
+        p = shutil.which(n)
+        if p:
+            return p
+    return None
+
+
+def _extract_rar(path, out):
+    """Extract a .rar by calling a real extractor directly (rarfile's backend
+    auto-detection is unreliable in containers). Tries several tools in order."""
+    import subprocess
+    candidates = []
+    bsdtar = _which_any(["bsdtar"])
+    if bsdtar:
+        candidates.append([bsdtar, "-xf", path, "-C", out])
+    unar = _which_any(["unar"])
+    if unar:
+        candidates.append([unar, "-force-overwrite", "-quiet",
+                            "-output-directory", out, path])
+    unrar = _which_any(["unrar", "unrar-free"]) or \
+        next((p for p in _WIN_UNRAR if os.path.isfile(p)), None)
+    if unrar:
+        candidates.append([unrar, "x", "-y", "-idq", path, out + os.sep])
+    sevenz = _which_any(["7z", "7za"]) or \
+        next((p for p in _WIN_7ZIP if os.path.isfile(p)), None)
+    if sevenz:
+        candidates.append([sevenz, "x", "-y", "-o" + out, path])
+
+    if not candidates:
+        raise RuntimeError(
+            "no RAR extractor found. Linux: `apt install libarchive-tools unar`; "
+            "Windows: install WinRAR or 7-Zip.")
+    last = ""
+    for cmd in candidates:
+        try:
+            r = subprocess.run(cmd, stdout=subprocess.DEVNULL,
+                               stderr=subprocess.PIPE)
+            # success = tool returned 0 AND produced at least one extracted file
+            if r.returncode == 0 and any(os.scandir(out)):
+                return
+            last = (r.stderr or b"").decode("utf-8", "replace")[:300] or f"exit {r.returncode}"
+        except Exception as e:  # tool missing/execution error -> try next
+            last = str(e)
+    raise RuntimeError(f"RAR extraction failed ({last}).")
+
+
+def _extract_archive(path):
     tmp = tempfile.mkdtemp(prefix="ingest_")
-    with zipfile.ZipFile(path) as z:
-        z.extractall(tmp)
-    # if the zip contains a single top folder, descend into it
+    if path.lower().endswith(".rar"):
+        _extract_rar(path, tmp)
+    else:
+        with zipfile.ZipFile(path) as z:
+            z.extractall(tmp)
+    # if the archive contains a single top folder, descend into it
     entries = [os.path.join(tmp, e) for e in os.listdir(tmp)]
     dirs = [e for e in entries if os.path.isdir(e)]
     if len(dirs) == 1 and not any(os.path.isfile(e) for e in entries):
@@ -71,11 +139,46 @@ def _guess_track(dirpath):
     return "غير محدد"
 
 
-def ingest_path(path, province_label=None, progress=None):
+def _bulk_upsert(db, model, rows, index_elements, update_cols, chunk=500):
+    """Batched INSERT ... ON CONFLICT DO UPDATE. Works on SQLite and Postgres."""
+    if not rows:
+        return
+    dialect = db.bind.dialect.name
+    if dialect == "postgresql":
+        from sqlalchemy.dialects.postgresql import insert as _insert
+    else:
+        from sqlalchemy.dialects.sqlite import insert as _insert
+    for i in range(0, len(rows), chunk):
+        batch = rows[i:i + chunk]
+        stmt = _insert(model)
+        stmt = stmt.on_conflict_do_update(
+            index_elements=index_elements,
+            set_={c: getattr(stmt.excluded, c) for c in update_cols},
+        )
+        db.execute(stmt, batch)
+
+
+def _parse_school(job):
+    """Worker: parse one school PDF. Runs in a separate process (CPU-bound)."""
+    pdf_path, track = job
+    fname = os.path.basename(pdf_path)
+    m = SCHOOL_RE.match(fname)
+    scode = m.group(1) if m else os.path.splitext(fname)[0]
+    sname = m.group(2).strip() if m else fname
+    try:
+        rows = parse_pdf(pdf_path)
+        return (scode, sname, track, rows, None)
+    except Exception as e:  # pragma: no cover - defensive
+        return (scode, sname, track, None, f"{fname}: {e}")
+
+
+def ingest_path(path, province_label=None, progress=None, workers=None):
+    """Ingest a province. PDF parsing is parallelized across CPU cores; DB writes
+    stay serial in this process (safe for SQLite; fast bulk upsert)."""
     init_db()
     cleanup = None
-    if path.lower().endswith(".zip"):
-        root, cleanup = _extract_zip(path)
+    if is_archive(path):
+        root, cleanup = _extract_archive(path)
         province_label = province_label or os.path.splitext(os.path.basename(path))[0]
     else:
         root = path
@@ -83,6 +186,10 @@ def ingest_path(path, province_label=None, progress=None):
 
     pcode, pname = parse_province(province_label)
     stats = {"schools": 0, "students": 0, "errors": []}
+    jobs = list(iter_school_pdfs(root))
+
+    if workers is None:
+        workers = int(os.environ.get("INGEST_WORKERS", "0")) or min(os.cpu_count() or 2, 8)
 
     with SessionLocal() as db:
         prov = db.get(Province, pcode)
@@ -91,42 +198,52 @@ def ingest_path(path, province_label=None, progress=None):
             db.add(prov)
             db.flush()
 
-        for pdf_path, track in iter_school_pdfs(root):
-            fname = os.path.basename(pdf_path)
-            m = SCHOOL_RE.match(fname)
-            scode = m.group(1) if m else os.path.splitext(fname)[0]
-            sname = m.group(2).strip() if m else fname
-            try:
-                rows = parse_pdf(pdf_path)
-            except Exception as e:
-                stats["errors"].append(f"{fname}: {e}")
-                continue
+        school_rows = {}   # scode -> dict
+        student_rows = []  # list of dicts
 
-            school = db.get(School, scode)
-            if not school:
-                school = School(code=scode, name=sname, track=track, province_code=pcode)
-                db.add(school)
-            else:
-                school.name, school.track, school.province_code = sname, track, pcode
-            db.flush()
-
+        def apply_result(res):
+            scode, sname, track, rows, err = res
+            if err:
+                stats["errors"].append(err)
+                return
+            school_rows[scode] = {"code": scode, "name": sname, "track": track,
+                                   "province_code": pcode}
             for r in rows:
-                st = db.get(Student, r["exam_no"])
-                if not st:
-                    st = Student(exam_no=r["exam_no"])
-                    db.add(st)
-                st.name = r["name"]
-                st.name_norm = normalize_ar(r["name"])
-                st.result = r["result"]
-                st.total = r["total"]
-                st.average = r["average"]
-                import json as _json
-                st.grades_json = _json.dumps(r["grades"], ensure_ascii=False)
-                st.school_code = scode
+                student_rows.append({
+                    "exam_no": r["exam_no"],
+                    "name": r["name"],
+                    "name_norm": normalize_ar(r["name"]),
+                    "result": r["result"],
+                    "total": r["total"],
+                    "average": r["average"],
+                    "grades_json": json.dumps(r["grades"], ensure_ascii=False),
+                    "province_code": pcode,
+                    "school_code": scode,
+                })
             stats["schools"] += 1
             stats["students"] += len(rows)
             if progress:
-                progress(fname, len(rows))
+                progress(sname, len(rows))
+
+        if workers > 1 and len(jobs) > 1:
+            try:
+                from concurrent.futures import ProcessPoolExecutor
+                with ProcessPoolExecutor(max_workers=workers) as ex:
+                    for res in ex.map(_parse_school, jobs, chunksize=4):
+                        apply_result(res)
+            except Exception:  # pool unavailable -> sequential fallback
+                for job in jobs:
+                    apply_result(_parse_school(job))
+        else:
+            for job in jobs:
+                apply_result(_parse_school(job))
+
+        # Bulk upsert (one batched statement per chunk) instead of per-row I/O.
+        _bulk_upsert(db, School, list(school_rows.values()),
+                     ["province_code", "code"], ["name", "track"])
+        _bulk_upsert(db, Student, student_rows, ["exam_no"],
+                     ["name", "name_norm", "result", "total", "average",
+                      "grades_json", "province_code", "school_code"])
         db.commit()
 
     if cleanup:

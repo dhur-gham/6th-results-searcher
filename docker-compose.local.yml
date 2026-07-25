@@ -1,0 +1,60 @@
+# LOCAL stack WITH the local Bot API server (no 20 MB upload cap on your PC).
+# Uses your existing SQLite DB (./data) — no Postgres. Bot + Bot API server run
+# together and share the `tgapi` volume so big uploads are read by path.
+#
+# Prereqs: Docker Desktop, and api_id/api_hash from https://my.telegram.org.
+# In .env set: TELEGRAM_TOKEN, TELEGRAM_API_ID, TELEGRAM_API_HASH, ADMIN_IDS.
+#
+# Run:  docker compose -f docker-compose.local.yml up --build
+# (Stop your host `uvicorn`/`python -m app.bot` first to avoid port/DB clashes.)
+
+services:
+  telegram-bot-api:
+    image: aiogram/telegram-bot-api:latest
+    environment:
+      TELEGRAM_API_ID: ${TELEGRAM_API_ID}
+      TELEGRAM_API_HASH: ${TELEGRAM_API_HASH}
+      TELEGRAM_LOCAL: 1
+    volumes:
+      - tgapi:/var/lib/telegram-bot-api
+    ports:
+      - "8081:8081"
+    restart: unless-stopped
+
+  api:
+    build: .
+    command: ["python", "-m", "uvicorn", "app.api:app", "--host", "0.0.0.0", "--port", "8000"]
+    ports:
+      - "8012:8000"           # open http://localhost:8012
+    environment:
+      CACHE_MODE: setup
+      ADMIN_TOKEN: ${ADMIN_TOKEN:-changeme}
+      DATA_DIR: /app/data
+    volumes:
+      - appdata:/app/data       # native Docker volume (NOT the slow 9p bind mount)
+      - ./citydata:/data
+    restart: unless-stopped
+
+  bot:
+    build: .
+    command: ["python", "-m", "app.bot"]
+    environment:
+      TELEGRAM_TOKEN: ${TELEGRAM_TOKEN}
+      ADMIN_IDS: ${ADMIN_IDS}
+      TELEGRAM_LOCAL: 1
+      TELEGRAM_BASE_URL: http://telegram-bot-api:8081/bot
+      TELEGRAM_BASE_FILE_URL: http://telegram-bot-api:8081/file/bot
+      DATA_DIR: /app/data
+      INGEST_WORKERS: ${INGEST_WORKERS:-4}
+      INGEST_CONCURRENCY: ${INGEST_CONCURRENCY:-3}
+    volumes:
+      - appdata:/app/data       # native Docker volume (NOT the slow 9p bind mount)
+      - ./citydata:/data
+      - tgapi:/var/lib/telegram-bot-api   # shared: read big uploads by path
+    depends_on:
+      - telegram-bot-api
+    restart: unless-stopped
+
+volumes:
+  tgapi:
+  appdata:      # SQLite DB on native ext4 (fast). Wipe with: docker compose ... down -v

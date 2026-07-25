@@ -1,0 +1,10 @@
+# Keep the image slim and free of local state/secrets.
+data/
+citydata/
+backups/
+.env
+.git/
+__pycache__/
+*.pyc
+.venv/
+venv/

@@ -18,6 +18,8 @@ Run:
 """
 import os
 import sys
+import time
+import asyncio
 import logging
 
 try:
@@ -36,6 +38,45 @@ logging.basicConfig(
 log = logging.getLogger("bot")
 
 MAX_RESULTS = 20
+
+_INGEST_SEM = None
+
+
+def _ingest_semaphore():
+    """Lazily create the ingest concurrency gate (bound to the running loop).
+    INGEST_CONCURRENCY jobs run at once (WAL + busy_timeout keep SQLite safe)."""
+    global _INGEST_SEM
+    if _INGEST_SEM is None:
+        n = max(1, int(os.environ.get("INGEST_CONCURRENCY", "3")))
+        _INGEST_SEM = asyncio.Semaphore(n)
+    return _INGEST_SEM
+
+
+async def _ingest_job(bot, chat_id, target, province_label, tmp_path):
+    """Background ingest job: runs concurrently with other jobs (bounded by the
+    semaphore), does the CPU/DB work off the event loop, reports when done."""
+    sem = _ingest_semaphore()
+    try:
+        async with sem:
+            t0 = time.monotonic()
+            stats = await asyncio.to_thread(ingest_path, target, province_label)
+            dt = time.monotonic() - t0
+        await bot.send_message(
+            chat_id,
+            f"✅ «{province_label}»\n"
+            f"المدارس: {stats.get('schools', 0)}\n"
+            f"الطلاب: {stats.get('students', 0)}\n"
+            f"الأخطاء: {len(stats.get('errors', []))}\n"
+            f"⏱ {dt:.1f} ثانية")
+    except Exception as e:  # pragma: no cover - defensive
+        log.exception("ingest job failed")
+        await bot.send_message(chat_id, f"❌ فشل الاستيراد «{province_label}»: {e}")
+    finally:
+        if tmp_path:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
 
 # ---------------------------------------------------------------------------
 # DB query helpers — same logic style as app/api.py, but direct (no HTTP).
@@ -67,9 +108,7 @@ def search_by_name(name: str, province: str | None = None):
         for t in tokens:
             stmt = stmt.where(Student.name_norm.like(f"%{t}%"))
         if province:
-            stmt = stmt.join(School, Student.school_code == School.code).where(
-                School.province_code == province
-            )
+            stmt = stmt.where(Student.province_code == province)
         stmt = stmt.order_by(Student.name).limit(MAX_RESULTS)
         rows = db.execute(stmt).scalars().all()
         return [s.to_dict() for s in rows]
@@ -322,34 +361,74 @@ def build_application(token: str):
             await update.effective_message.reply_text("🚫 هذه الميزة للمشرفين فقط.")
             return
         fname = (doc.file_name or "").lower()
-        if not fname.endswith(".zip"):
-            await update.effective_message.reply_text("أرسل ملف .zip يحتوي مجلدات المحافظة.")
+        if not fname.endswith((".zip", ".rar")):
+            await update.effective_message.reply_text("أرسل ملف .zip أو .rar يحتوي مجلدات المحافظة.")
             return
 
-        await update.effective_message.reply_text("⏳ جارٍ تنزيل الملف ومعالجته...")
-        import tempfile
-        fd, tmp_path = tempfile.mkstemp(suffix=".zip")
-        os.close(fd)
-        try:
-            tg_file = await doc.get_file()
-            await tg_file.download_to_drive(tmp_path)
-            stats = ingest_path(tmp_path)
-            await update.effective_message.reply_text(
-                "✅ تم الاستيراد.\n"
-                f"المدارس: {stats.get('schools', 0)}\n"
-                f"الطلاب: {stats.get('students', 0)}\n"
-                f"الأخطاء: {len(stats.get('errors', []))}"
-            )
-        except Exception as e:  # pragma: no cover - defensive
-            log.exception("ingest failed")
-            await update.effective_message.reply_text(f"❌ فشل الاستيراد: {e}")
-        finally:
-            try:
-                os.remove(tmp_path)
-            except OSError:
-                pass
+        local_mode = os.environ.get("TELEGRAM_LOCAL", "").strip() in ("1", "true", "True")
 
-    application = Application.builder().token(token).build()
+        # Public Bot API caps bot downloads (getFile) at 20 MB. With a local Bot
+        # API server (TELEGRAM_LOCAL=1) there is NO limit, so skip this guard.
+        TG_LIMIT = 20 * 1024 * 1024
+        if not local_mode and (doc.file_size or 0) > TG_LIMIT:
+            mb = (doc.file_size or 0) / 1024 / 1024
+            await update.effective_message.reply_text(
+                f"⚠️ الملف كبير ({mb:.0f} ميغابايت). تيليجرام يسمح للبوت بتنزيل 20 ميغابايت كحد أقصى.\n\n"
+                "للمحافظات الكبيرة استخدم أحد البدائل (بلا حدود):\n"
+                "• رفع عبر الـ API:\n"
+                "  curl -X POST <domain>/api/ingest -H \"Authorization: Bearer <ADMIN_TOKEN>\" "
+                "-F province=<code_name> -F file=@province.rar\n"
+                "• أو فعّل خادم Bot API المحلي (TELEGRAM_LOCAL=1) لرفع حتى 2 غيغابايت."
+            )
+            return
+
+        import tempfile
+        suffix = ".rar" if fname.endswith(".rar") else ".zip"
+        tmp_path = None
+        province_label = os.path.splitext(doc.file_name or "")[0]
+        try:
+            # Download (I/O). With a local Bot API server getFile makes the server
+            # fetch the whole file first, so give it generous timeouts.
+            tg_file = await doc.get_file(
+                read_timeout=1800, connect_timeout=60,
+                write_timeout=60, pool_timeout=60,
+            )
+            local_path = getattr(tg_file, "file_path", None)
+            if local_mode and local_path and os.path.isfile(local_path):
+                ingest_target = local_path            # shared volume, no download
+            else:
+                fd, tmp_path = tempfile.mkstemp(suffix=suffix)
+                os.close(fd)
+                await tg_file.download_to_drive(tmp_path)
+                ingest_target = tmp_path
+        except Exception as e:  # pragma: no cover - defensive
+            log.exception("download failed")
+            await update.effective_message.reply_text(f"❌ فشل التنزيل: {e}")
+            if tmp_path:
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
+            return
+
+        # Fire a background job and return immediately, so every file is accepted
+        # right away and jobs run concurrently (bounded by INGEST_CONCURRENCY).
+        asyncio.create_task(_ingest_job(
+            context.bot, update.effective_chat.id,
+            ingest_target, province_label, tmp_path))
+        await update.effective_message.reply_text(
+            f"📥 «{province_label}» أُضيفت للمعالجة في الخلفية.")
+
+    builder = Application.builder().token(token)
+    # Optional local Bot API server (no 20 MB download cap, up to 2 GB uploads,
+    # and files arrive as a local path — no download round-trip). Env-gated so
+    # the default (public api.telegram.org) is unchanged.
+    if os.environ.get("TELEGRAM_LOCAL", "").strip() in ("1", "true", "True"):
+        base = os.environ.get("TELEGRAM_BASE_URL", "http://telegram-bot-api:8081/bot")
+        base_file = os.environ.get("TELEGRAM_BASE_FILE_URL", "http://telegram-bot-api:8081/file/bot")
+        builder = builder.base_url(base).base_file_url(base_file).local_mode(True)
+        log.info("Using LOCAL Bot API server at %s", base)
+    application = builder.build()
     application.add_handler(CommandHandler("start", cmd_start))
     application.add_handler(CommandHandler("help", cmd_help))
     application.add_handler(CallbackQueryHandler(on_menu, pattern=r"^mode:"))
@@ -372,7 +451,9 @@ def main():
     init_db()
     log.info("Starting Telegram bot (long polling)...")
     application = build_application(token)
-    application.run_polling(allowed_updates=None)
+    # drop_pending_updates: ignore the backlog on startup so restarting the bot
+    # doesn't re-ingest files that were already sent.
+    application.run_polling(allowed_updates=None, drop_pending_updates=True)
     return 0
 
 

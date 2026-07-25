@@ -125,9 +125,11 @@ def schools(
         codes = [s.code for s in schools_list]
         counts = {}
         if codes:
+            # school codes repeat across provinces -> scope the count to this province
             counts = dict(
                 db.execute(
                     select(Student.school_code, func.count(Student.exam_no))
+                    .where(Student.province_code == province)
                     .where(Student.school_code.in_(codes))
                     .group_by(Student.school_code)
                 ).all()
@@ -175,9 +177,7 @@ def search(
         for t in tokens:
             stmt = stmt.where(Student.name_norm.like(f"%{t}%"))
         if province:
-            stmt = stmt.join(School, Student.school_code == School.code).where(
-                School.province_code == province
-            )
+            stmt = stmt.where(Student.province_code == province)
         if school:
             stmt = stmt.where(Student.school_code == school)
         stmt = stmt.order_by(Student.name).limit(MAX_RESULTS)

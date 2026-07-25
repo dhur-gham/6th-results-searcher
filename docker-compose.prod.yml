@@ -59,6 +59,19 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
+  # Local Bot API server: removes the 20 MB bot download cap (uploads up to 2 GB)
+  # and hands files to the bot as a local path (shared `tgapi` volume) — no
+  # download round-trip. Needs api_id/api_hash from https://my.telegram.org.
+  telegram-bot-api:
+    image: aiogram/telegram-bot-api:latest
+    environment:
+      TELEGRAM_API_ID: ${TELEGRAM_API_ID}
+      TELEGRAM_API_HASH: ${TELEGRAM_API_HASH}
+      TELEGRAM_LOCAL: 1
+    volumes:
+      - tgapi:/var/lib/telegram-bot-api
+    restart: unless-stopped
+
   bot:
     build: .
     command: ["python", "-m", "app.bot"]
@@ -67,12 +80,20 @@ services:
       TELEGRAM_TOKEN: ${TELEGRAM_TOKEN}
       ADMIN_IDS: ${ADMIN_IDS}
       DATA_DIR: /app/data
+      # Point the bot at the local Bot API server. Set TELEGRAM_LOCAL=0 in .env
+      # to fall back to public api.telegram.org (20 MB cap).
+      TELEGRAM_LOCAL: ${TELEGRAM_LOCAL:-1}
+      TELEGRAM_BASE_URL: http://telegram-bot-api:8081/bot
+      TELEGRAM_BASE_FILE_URL: http://telegram-bot-api:8081/file/bot
     volumes:
       - ./data:/app/data
       - ./citydata:/data
+      - tgapi:/var/lib/telegram-bot-api   # read big uploads by path (no download)
     depends_on:
       postgres:
         condition: service_healthy
+      telegram-bot-api:
+        condition: service_started
     restart: unless-stopped
 
   caddy:
@@ -111,3 +132,4 @@ volumes:
   pgdata:
   caddy_data:
   caddy_config:
+  tgapi:

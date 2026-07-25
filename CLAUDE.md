@@ -19,13 +19,16 @@ app/
   glyph.py       Arabic glyph decoding (the hard part — see below). DO NOT casually edit.
   parse_pdf.py   PDF -> student rows. Coordinate-based table extraction.
   db.py          SQLAlchemy models. SQLite default, Postgres via DATABASE_URL.
-  ingest.py      province folder/zip -> DB (idempotent upsert). CLI: python -m app.ingest
+  ingest.py      province folder/zip/rar -> DB (idempotent upsert; parallel PDF parse
+                 + bulk upsert). CLI: python -m app.ingest
   api.py         FastAPI: /api/provinces, /api/schools, /api/search, POST /api/ingest. Serves web/.
   bot.py         Telegram bot. Queries DB directly. Self-disables without TELEGRAM_TOKEN.
+                 Admin ingest runs as a background job; optional local Bot API server.
 web/             Static RTL Arabic SPA (index.html + styles.css + app.js). No build step.
 deploy/          Caddyfile, backup.sh, DEPLOY.md (Contabo VPS + Cloudflare).
 docker-compose.yml        local (SQLite)
-docker-compose.prod.yml   production (Postgres + API + bot + Caddy + backup)
+docker-compose.local.yml  local (SQLite) + local Bot API server for big uploads
+docker-compose.prod.yml   production (Postgres + API + bot + Bot API server + Caddy + backup)
 data/            SQLite db + temp (gitignored)
 ```
 
@@ -66,6 +69,10 @@ students / 13.6s / 0 failures.
 - Dataset is tiny: whole country ≈ 300–500k rows, **< 1 GB, fits in RAM**.
 - `exam_no` is the primary key and globally unique → exam-number search is an O(1)
   indexed lookup and sidesteps Arabic entirely. Prefer it.
+- **School codes are only unique WITHIN a province** (e.g. 55051 "externals"
+  repeats in every province). So `School`'s PK is composite `(province_code, code)`,
+  and `Student` carries `province_code` + `school_code` (composite FK). Always scope
+  school lookups/counts by province — never join/filter on `school_code` alone.
 - `name_norm` (normalized via `glyph.normalize_ar`) is the indexed search column.
   Always normalize a name query the SAME way before matching.
 
@@ -82,8 +89,11 @@ prints Arabic with `PYTHONIOENCODING=utf-8` and run `python -X utf8`, or you get
 
 ## Operational gotchas (hit this session — don't repeat)
 
-- **SQLite lock:** you cannot re-ingest while the uvicorn server holds `data/results.db`
-  ("database is busy"). Stop the server → ingest → start it. (Postgres has no such issue.)
+- **SQLite lock:** WAL + `busy_timeout=60000` (see `db.py`) let a writer wait up to
+  60s for the lock, so a re-ingest while uvicorn is running usually just blocks briefly
+  instead of failing. A long ingest can still time out under heavy read load — if you
+  hit "database is locked", stop the server → ingest → start it. (Postgres has no such
+  issue, and can run `INGEST_CONCURRENCY` > 1.)
 - **Port already in use:** starting uvicorn on a port that's still bound silently
   fails; the OLD process keeps answering with STALE data/cache. Kill all uvicorn
   first (`pkill -f "uvicorn app.api"`, or on Windows kill the `python.exe` whose

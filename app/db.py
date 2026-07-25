@@ -10,7 +10,8 @@ import os
 import json
 
 from sqlalchemy import (
-    create_engine, String, Integer, Float, Text, ForeignKey, Index, select
+    create_engine, String, Integer, Float, Text, ForeignKey,
+    ForeignKeyConstraint, Index, select,
 )
 from sqlalchemy.orm import (
     DeclarativeBase, Mapped, mapped_column, relationship, sessionmaker
@@ -23,6 +24,25 @@ DATABASE_URL = os.environ.get("DATABASE_URL", DEFAULT_SQLITE)
 
 engine = create_engine(DATABASE_URL, future=True, pool_pre_ping=True)
 SessionLocal = sessionmaker(bind=engine, expire_on_commit=False, future=True)
+
+# SQLite performance pragmas: WAL avoids the big rollback-journal rewrite per
+# transaction (huge on slow/virtualized filesystems), NORMAL sync is safe under
+# WAL, and generous cache/mmap keep the working set in memory. Big win for bulk
+# ingest. Applied on every new connection.
+if DATABASE_URL.startswith("sqlite"):
+    from sqlalchemy import event
+
+    @event.listens_for(engine, "connect")
+    def _sqlite_pragmas(dbapi_conn, _rec):
+        cur = dbapi_conn.cursor()
+        cur.execute("PRAGMA journal_mode=WAL")
+        cur.execute("PRAGMA synchronous=NORMAL")
+        cur.execute("PRAGMA busy_timeout=60000")   # wait up to 60s for the write lock
+
+        cur.execute("PRAGMA temp_store=MEMORY")
+        cur.execute("PRAGMA cache_size=-131072")   # ~128 MB page cache
+        cur.execute("PRAGMA mmap_size=268435456")  # 256 MB mmap
+        cur.close()
 
 
 class Base(DeclarativeBase):
@@ -38,10 +58,12 @@ class Province(Base):
 
 class School(Base):
     __tablename__ = "schools"
+    # School codes are only unique WITHIN a province (e.g. 55051 "externals"
+    # repeats in every province), so identity is (province_code, code).
+    province_code: Mapped[str] = mapped_column(ForeignKey("provinces.code"), primary_key=True)
     code: Mapped[str] = mapped_column(String(16), primary_key=True)
     name: Mapped[str] = mapped_column(String(128), index=True)
     track: Mapped[str] = mapped_column(String(16), index=True)  # علمي / أدبي / فنون
-    province_code: Mapped[str] = mapped_column(ForeignKey("provinces.code"), index=True)
     province: Mapped["Province"] = relationship(back_populates="schools")
     students: Mapped[list["Student"]] = relationship(back_populates="school")
 
@@ -55,8 +77,15 @@ class Student(Base):
     total: Mapped[int | None] = mapped_column(Integer)
     average: Mapped[float | None] = mapped_column(Float)
     grades_json: Mapped[str] = mapped_column(Text, default="{}")
-    school_code: Mapped[str] = mapped_column(ForeignKey("schools.code"), index=True)
+    province_code: Mapped[str] = mapped_column(String(8), index=True)
+    school_code: Mapped[str] = mapped_column(String(16), index=True)
     school: Mapped["School"] = relationship(back_populates="students")
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["province_code", "school_code"],
+            ["schools.province_code", "schools.code"],
+        ),
+    )
 
     @property
     def grades(self) -> dict:

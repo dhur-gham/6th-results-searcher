@@ -48,6 +48,23 @@ ADMIN_IDS=<your telegram numeric id, for zip uploads via the bot>
 CACHE_MODE=setup        # keep "setup" until all cities are loaded, then switch to prod
 ```
 
+## 2b. (Optional) Big Telegram uploads — local Bot API server
+
+The public Telegram Bot API caps bot file downloads at **20 MB**, so full-province
+`.rar` files can't come through the bot. The stack includes a `telegram-bot-api`
+service that lifts this to **2 GB** and hands files to the bot as a local path (no
+download round-trip). To enable it:
+
+1. Log in at **https://my.telegram.org** → **API development tools** → create an app.
+2. Copy **api_id** and **api_hash** into `.env`:
+   ```ini
+   TELEGRAM_LOCAL=1
+   TELEGRAM_API_ID=<your api_id>
+   TELEGRAM_API_HASH=<your api_hash>
+   ```
+That's it — `docker compose ... up` starts the local server and the bot uses it
+automatically. Set `TELEGRAM_LOCAL=0` to fall back to the public API (20 MB cap).
+
 ## 3. Launch
 
 ```bash
