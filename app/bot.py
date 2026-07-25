@@ -24,13 +24,13 @@ import logging
 
 try:
     from .db import (init_db, reset_all, SessionLocal, Province, School, Student,
-                     load_province_counters)
+                     load_province_counters, get_data_version)
     from .glyph import normalize_ar
     from .ingest import ingest_path
     from . import analytics
 except ImportError:  # allow running as a top-level module too
     from db import (init_db, reset_all, SessionLocal, Province, School, Student,
-                    load_province_counters)
+                    load_province_counters, get_data_version)
     from glyph import normalize_ar
     from ingest import ingest_path
     import analytics
@@ -111,11 +111,37 @@ def _clear_query_caches():
     _count_cache.clear()
 
 
+# Cross-process cache invalidation: an ingest via the API container bumps
+# data_version in the DB; poll it (at most every few seconds) so this process
+# drops stale entries too — mirror of the same mechanism in app/api.py.
+_VERSION_POLL_SECONDS = float(os.environ.get("CACHE_VERSION_POLL", "5"))
+_data_version = None
+_version_checked_at = 0.0
+
+
+def _maybe_refresh_caches():
+    global _data_version, _version_checked_at
+    now = time.monotonic()
+    if now - _version_checked_at < _VERSION_POLL_SECONDS:
+        return
+    _version_checked_at = now
+    try:
+        v = get_data_version()
+    except Exception:   # transient DB hiccup: keep serving from caches
+        return
+    if _data_version is None:
+        _data_version = v
+    elif v != _data_version:
+        _data_version = v
+        _clear_query_caches()
+
+
 def lookup_exam_no(exam_no: str):
     """Exact primary-key lookup. Returns Student.to_dict() or None."""
     exam_no = (exam_no or "").strip()
     if not exam_no:
         return None
+    _maybe_refresh_caches()
     if exam_no in _exam_cache:
         return _exam_cache[exam_no]
     with SessionLocal() as db:
@@ -137,6 +163,7 @@ def search_by_name(name: str, province: str | None = None,
     tokens = [t for t in norm.split() if t]
     if not tokens:
         return [], 0
+    _maybe_refresh_caches()
     phrase = " ".join(tokens)
     count_key = (phrase, province or "")
     with SessionLocal() as db:

@@ -23,12 +23,14 @@ import argparse
 try:
     from .parse_pdf import parse_pdf
     from .glyph import normalize_ar
-    from .db import init_db, SessionLocal, Province, School, Student, save_province_stats
+    from .db import (init_db, SessionLocal, Province, School, Student,
+                     save_province_stats, bump_data_version)
     from . import analytics
 except ImportError:
     from parse_pdf import parse_pdf
     from glyph import normalize_ar
-    from db import init_db, SessionLocal, Province, School, Student, save_province_stats
+    from db import (init_db, SessionLocal, Province, School, Student,
+                    save_province_stats, bump_data_version)
     import analytics
 
 SCHOOL_RE = re.compile(r"^(\d+)[_\-\s]+(.+?)\.pdf$", re.IGNORECASE)
@@ -259,6 +261,7 @@ def ingest_path(path, province_label=None, progress=None, workers=None):
     # Persist this province's analytics counters (overall is merged on read).
     counters["schools"] = len(school_rows)
     save_province_stats(pcode, pname, counters)
+    bump_data_version()   # tell every process to drop its in-process caches
 
     if cleanup:
         import shutil

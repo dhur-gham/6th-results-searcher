@@ -10,6 +10,7 @@ Runs with zero required env vars against the existing populated SQLite DB:
     python -m uvicorn app.api:app --port 8000
 """
 import os
+import time
 import shutil
 import tempfile
 from functools import lru_cache
@@ -23,13 +24,13 @@ from sqlalchemy.orm import Session
 
 try:
     from .db import (init_db, reset_all, SessionLocal, Province, School, Student,
-                     load_province_counters, recompute_all_stats)
+                     load_province_counters, recompute_all_stats, get_data_version)
     from .glyph import normalize_ar
     from .ingest import ingest_path
     from . import analytics
 except ImportError:  # allow running as a top-level module too
     from db import (init_db, reset_all, SessionLocal, Province, School, Student,
-                    load_province_counters, recompute_all_stats)
+                    load_province_counters, recompute_all_stats, get_data_version)
     import analytics
     from glyph import normalize_ar
     from ingest import ingest_path
@@ -95,9 +96,37 @@ def _clear_caches():
     _stats_cache.clear()
 
 
+# Cross-process cache invalidation. Ingest/reset may happen in ANOTHER process
+# (a different gunicorn worker, or the bot container) — it bumps data_version
+# in the DB, and each worker polls that stamp at most once per poll interval,
+# dropping its in-process caches on change. Fixes permanently stale entries
+# (including cached exam_no misses from before a province was uploaded).
+_VERSION_POLL_SECONDS = float(os.environ.get("CACHE_VERSION_POLL", "5"))
+_data_version = None
+_version_checked_at = 0.0
+
+
+def _maybe_refresh_caches():
+    global _data_version, _version_checked_at
+    now = time.monotonic()
+    if now - _version_checked_at < _VERSION_POLL_SECONDS:
+        return
+    _version_checked_at = now
+    try:
+        v = get_data_version()
+    except Exception:   # transient DB hiccup: keep serving from caches
+        return
+    if _data_version is None:
+        _data_version = v          # first check after startup: nothing cached yet
+    elif v != _data_version:
+        _data_version = v
+        _clear_caches()
+
+
 @app.get("/api/provinces")
 def provinces(db: Session = Depends(get_db)):
     global _provinces_cache
+    _maybe_refresh_caches()
     if _provinces_cache is None:
         counts = dict(
             db.execute(
@@ -120,6 +149,7 @@ def schools(
     db: Session = Depends(get_db),
 ):
     key = (province, track or "", (q or "").strip())
+    _maybe_refresh_caches()
     if key not in _schools_cache:
         stmt = select(School).where(School.province_code == province)
         if track:
@@ -161,6 +191,7 @@ def search(
     school: str | None = None,
     db: Session = Depends(get_db),
 ):
+    _maybe_refresh_caches()
     if exam_no:
         exam_no = exam_no.strip()
         if exam_no in _student_cache:
@@ -255,6 +286,7 @@ def _analytics_payload(province=None):
 def stats(province: str | None = None):
     """Analytics: overall totals + per-subject + per-province. Pass ?province=CODE
     for one city's full breakdown (including its per-subject rows)."""
+    _maybe_refresh_caches()
     return cached_json(_analytics_payload(province))
 
 

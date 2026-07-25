@@ -78,6 +78,34 @@ class ProvinceStats(Base):
     data_json: Mapped[str] = mapped_column(Text, default="{}")
 
 
+class DataVersion(Base):
+    """Single-row stamp bumped on every data mutation (ingest / reset).
+
+    In-process caches live in several processes (8 gunicorn workers + the bot
+    container); a mutation in one process can't clear the others' caches
+    directly. Each process instead polls this row every few seconds and drops
+    its caches when the version changes. Survives reset_all on purpose."""
+    __tablename__ = "data_version"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    version: Mapped[int] = mapped_column(Integer, default=0)
+
+
+def get_data_version() -> int:
+    with SessionLocal() as db:
+        row = db.get(DataVersion, 1)
+        return row.version if row else 0
+
+
+def bump_data_version():
+    with SessionLocal() as db:
+        row = db.get(DataVersion, 1)
+        if row is None:
+            db.add(DataVersion(id=1, version=1))
+        else:
+            row.version += 1
+        db.commit()
+
+
 class Student(Base):
     __tablename__ = "students"
     exam_no: Mapped[str] = mapped_column(String(24), primary_key=True)
@@ -169,6 +197,7 @@ def reset_all():
             conn.exec_driver_sql("PRAGMA wal_checkpoint(TRUNCATE)")
             conn.exec_driver_sql("VACUUM")
             conn.exec_driver_sql("PRAGMA wal_checkpoint(TRUNCATE)")
+    bump_data_version()   # tell every process to drop its in-process caches
     return counts
 
 
