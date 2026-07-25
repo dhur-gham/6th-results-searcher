@@ -193,55 +193,61 @@ def ingest_path(path, province_label=None, progress=None, workers=None):
     if workers is None:
         workers = int(os.environ.get("INGEST_WORKERS", "0")) or min(os.cpu_count() or 2, 8)
 
+    school_rows = {}   # scode -> dict
+    student_rows = []  # list of dicts
+    counters = analytics.blank()   # analytics accumulated student-by-student
+
+    def apply_result(res):
+        scode, sname, track, rows, err = res
+        if err:
+            stats["errors"].append(err)
+            return
+        school_rows[scode] = {"code": scode, "name": sname, "track": track,
+                              "province_code": pcode}
+        for r in rows:
+            analytics.accumulate(counters, r["result"], r["average"], r["grades"])
+            student_rows.append({
+                "exam_no": r["exam_no"],
+                "name": r["name"],
+                "name_norm": normalize_ar(r["name"]),
+                "result": r["result"],
+                "total": r["total"],
+                "average": r["average"],
+                "grades_json": json.dumps(r["grades"], ensure_ascii=False),
+                "province_code": pcode,
+                "school_code": scode,
+            })
+        stats["schools"] += 1
+        stats["students"] += len(rows)
+        if progress:
+            progress(sname, len(rows))
+
+    # ---- Parse phase: NO session/transaction open. (A session here used to
+    # hold SQLite's write lock for the entire multi-minute parse, which is what
+    # made concurrent ingests die with "database is locked".)
+    executor = None
+    if workers > 1 and len(jobs) > 1:
+        try:
+            from concurrent.futures import ProcessPoolExecutor
+            executor = ProcessPoolExecutor(max_workers=workers)
+        except Exception:  # pool unavailable on this platform -> sequential
+            executor = None
+    if executor is not None:
+        # A mid-iteration pool failure (e.g. BrokenProcessPool) propagates:
+        # falling back here would re-apply results already accumulated and
+        # double-count analytics / duplicate exam_nos in the upsert batches.
+        with executor as ex:
+            for res in ex.map(_parse_school, jobs, chunksize=4):
+                apply_result(res)
+    else:
+        for job in jobs:
+            apply_result(_parse_school(job))
+
+    # ---- Write phase: one short transaction. Province is upserted like the
+    # rest (get-then-insert raced when two jobs ingested the same new province).
     with SessionLocal() as db:
-        prov = db.get(Province, pcode)
-        if not prov:
-            prov = Province(code=pcode, name=pname)
-            db.add(prov)
-            db.flush()
-
-        school_rows = {}   # scode -> dict
-        student_rows = []  # list of dicts
-        counters = analytics.blank()   # analytics accumulated student-by-student
-
-        def apply_result(res):
-            scode, sname, track, rows, err = res
-            if err:
-                stats["errors"].append(err)
-                return
-            school_rows[scode] = {"code": scode, "name": sname, "track": track,
-                                   "province_code": pcode}
-            for r in rows:
-                analytics.accumulate(counters, r["result"], r["average"], r["grades"])
-                student_rows.append({
-                    "exam_no": r["exam_no"],
-                    "name": r["name"],
-                    "name_norm": normalize_ar(r["name"]),
-                    "result": r["result"],
-                    "total": r["total"],
-                    "average": r["average"],
-                    "grades_json": json.dumps(r["grades"], ensure_ascii=False),
-                    "province_code": pcode,
-                    "school_code": scode,
-                })
-            stats["schools"] += 1
-            stats["students"] += len(rows)
-            if progress:
-                progress(sname, len(rows))
-
-        if workers > 1 and len(jobs) > 1:
-            try:
-                from concurrent.futures import ProcessPoolExecutor
-                with ProcessPoolExecutor(max_workers=workers) as ex:
-                    for res in ex.map(_parse_school, jobs, chunksize=4):
-                        apply_result(res)
-            except Exception:  # pool unavailable -> sequential fallback
-                for job in jobs:
-                    apply_result(_parse_school(job))
-        else:
-            for job in jobs:
-                apply_result(_parse_school(job))
-
+        _bulk_upsert(db, Province, [{"code": pcode, "name": pname}],
+                     ["code"], ["name"])
         # Bulk upsert (one batched statement per chunk) instead of per-row I/O.
         _bulk_upsert(db, School, list(school_rows.values()),
                      ["province_code", "code"], ["name", "track"])
