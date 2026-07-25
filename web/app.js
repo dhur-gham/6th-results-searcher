@@ -19,6 +19,49 @@
   var schoolSel = document.getElementById("school");
   var nameInput = document.getElementById("name");
   var out = document.getElementById("output");
+  var searchCard = document.querySelector(".search-card");
+  var searchToggle = document.getElementById("searchToggle");
+  var modal = document.getElementById("modal");
+
+  // ---- collapsible search card ----
+  // Auto-collapses once a search returns results (frees the screen for them);
+  // the slim toggle handle reopens it for a new search.
+  function collapseSearch() {
+    searchCard.classList.add("collapsed");
+    searchToggle.setAttribute("aria-expanded", "false");
+  }
+  function expandSearch() {
+    searchCard.classList.remove("collapsed");
+    searchToggle.setAttribute("aria-expanded", "true");
+  }
+  searchToggle.addEventListener("click", expandSearch);
+  var modalBody = document.getElementById("modalBody");
+  var modalBack = document.getElementById("modalBack");
+
+  // ---- full-screen card view (modal) ----
+  // Opens a student card as a full-view sheet over the page. Closing returns to
+  // whatever is underneath (the results list, or the search form) — no re-render.
+  function openCard(stu, backLabel) {
+    modalBody.innerHTML = "";
+    modalBody.appendChild(renderCard(stu, null));
+    modalBack.querySelector("span").textContent = backLabel || "عودة";
+    modal.classList.add("open");
+    modal.setAttribute("aria-hidden", "false");
+    document.body.classList.add("modal-open");
+    modal.scrollTop = 0;
+    modalBack.focus();
+  }
+  function closeCard() {
+    modal.classList.remove("open");
+    modal.setAttribute("aria-hidden", "true");
+    document.body.classList.remove("modal-open");
+    modalBody.innerHTML = "";
+  }
+  modalBack.addEventListener("click", closeCard);
+  modal.addEventListener("click", function (e) { if (e.target === modal) closeCard(); });
+  document.addEventListener("keydown", function (e) {
+    if (e.key === "Escape" && modal.classList.contains("open")) closeCard();
+  });
 
   // ---- helpers ----
   function el(tag, cls, text) {
@@ -235,9 +278,8 @@
       item.appendChild(chev);
 
       item.addEventListener("click", function () {
-        clearOut();
-        out.appendChild(renderCard(stu, function () { renderList(results); }));
-        out.scrollIntoView({ behavior: "smooth", block: "start" });
+        // keep the list underneath; the card opens full-view, back closes it
+        openCard(stu, "عودة إلى النتائج");
       });
       box.appendChild(item);
     });
@@ -258,7 +300,8 @@
     try {
       var stu = await getJSON(api("/api/search?exam_no=" + encodeURIComponent(digits)));
       clearOut();
-      out.appendChild(renderCard(stu, null));
+      collapseSearch();
+      openCard(stu, "عودة");
     } catch (err) {
       if (err.code === 404) {
         showMessage("🔍", "لا توجد نتيجة مطابقة للرقم « " + digits + " ». تأكد من الرقم وحاول مجددًا.", false);
@@ -289,9 +332,9 @@
         showMessage("🔍", "لا توجد نتائج مطابقة للاسم « " + name + " ». جرّب اسمًا أقصر أو تحقق من المحافظة/المدرسة.", false);
         return;
       }
+      collapseSearch();
       if (results.length === 1) {
-        clearOut();
-        out.appendChild(renderCard(results[0], null));
+        openCard(results[0], "عودة");
       } else {
         renderList(results);
       }

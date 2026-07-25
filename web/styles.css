@@ -309,6 +309,47 @@ select{appearance:none;padding-inline-start:40px}
 }
 .rc-back svg{width:16px;height:16px;transform:scaleX(-1)}
 
+/* ===== Collapsible search card ===== */
+/* The toggle handle only appears once the card is collapsed (after a search). */
+.search-toggle{display:none}
+.search-card.collapsed{padding-top:14px;padding-bottom:14px}
+.search-card.collapsed .search-toggle{
+  display:flex;align-items:center;gap:10px;width:100%;
+  background:transparent;border:0;cursor:pointer;font-family:inherit;
+  font-weight:800;font-size:1rem;color:var(--primary);padding:2px;
+}
+.search-toggle .st-ico{width:18px;height:18px;flex:none}
+.search-toggle .st-label{text-align:start}
+.search-toggle .st-chev{width:20px;height:20px;margin-inline-start:auto;color:var(--muted)}
+.search-card.collapsed .search-body{display:none}
+
+/* ===== Full-screen card view (modal) ===== */
+body.modal-open{overflow:hidden}
+.modal{
+  position:fixed;inset:0;z-index:100;display:none;overflow-y:auto;
+  background:
+    radial-gradient(1100px 700px at 100% -10%, var(--bg-grad-1), transparent 60%),
+    radial-gradient(900px 600px at -10% 10%, var(--bg-grad-2), transparent 55%),
+    var(--bg);
+  -webkit-overflow-scrolling:touch;
+}
+.modal.open{display:block;animation:fade .18s ease}
+@keyframes fade{from{opacity:0}to{opacity:1}}
+.modal-inner{max-width:640px;margin:0 auto;padding:16px 16px 40px;min-height:100%}
+.modal-back{
+  display:inline-flex;align-items:center;gap:6px;
+  margin:4px 0 14px;
+  font-family:inherit;font-size:.95rem;font-weight:700;color:var(--primary);
+  background:var(--surface);border:1px solid var(--border);border-radius:999px;
+  padding:9px 16px;cursor:pointer;box-shadow:var(--shadow-sm);
+}
+.modal-back:hover{border-color:var(--primary)}
+.modal-back svg{width:16px;height:16px;transform:scaleX(-1)}
+/* card fills the sheet: drop the inline entry animation (the sheet fades instead) */
+.modal .result-card{animation:none}
+/* the in-card back button is redundant inside the modal */
+.modal .rc-back{display:none}
+
 @media (max-width:360px){
   .rc-stats{grid-template-columns:1fr}
 }
