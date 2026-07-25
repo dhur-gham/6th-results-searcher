@@ -24,13 +24,13 @@ try:
     from .parse_pdf import parse_pdf
     from .glyph import normalize_ar
     from .db import (init_db, SessionLocal, Province, School, Student,
-                     save_province_stats, bump_data_version)
+                     save_province_stats, bump_data_version, DATA_DIR)
     from . import analytics
 except ImportError:
     from parse_pdf import parse_pdf
     from glyph import normalize_ar
     from db import (init_db, SessionLocal, Province, School, Student,
-                    save_province_stats, bump_data_version)
+                    save_province_stats, bump_data_version, DATA_DIR)
     import analytics
 
 SCHOOL_RE = re.compile(r"^(\d+)[_\-\s]+(.+?)\.pdf$", re.IGNORECASE)
@@ -110,12 +110,40 @@ def _extract_rar(path, out):
     raise RuntimeError(f"RAR extraction failed ({last}).")
 
 
+def _fix_zip_names(z):
+    """Zips made by Windows store entry names in the OEM codepage without the
+    UTF-8 flag; zipfile then decodes them as cp437, turning Arabic school names
+    into mojibake. Recover the original bytes and re-decode (UTF-8 first, then
+    Arabic OEM cp720) when that yields Arabic text."""
+    for info in z.infolist():
+        if info.flag_bits & 0x800:      # entry already flagged UTF-8
+            continue
+        try:
+            raw = info.filename.encode("cp437")
+        except UnicodeEncodeError:      # not a cp437 round-trip -> leave as-is
+            continue
+        for enc in ("utf-8", "cp720"):
+            try:
+                fixed = raw.decode(enc)
+            except (UnicodeDecodeError, LookupError):
+                continue
+            if any("؀" <= ch <= "ۿ" for ch in fixed):
+                info.filename = fixed
+            break
+
+
 def _extract_archive(path):
-    tmp = tempfile.mkdtemp(prefix="ingest_")
+    # Extract inside DATA_DIR (the mounted volume), not the container-layer
+    # tmpfs: a 2 GB archive needs ~2x its size transiently, and the root FS
+    # is the wrong place to stage that.
+    tmp_root = os.path.join(DATA_DIR, "tmp")
+    os.makedirs(tmp_root, exist_ok=True)
+    tmp = tempfile.mkdtemp(prefix="ingest_", dir=tmp_root)
     if path.lower().endswith(".rar"):
         _extract_rar(path, tmp)
     else:
         with zipfile.ZipFile(path) as z:
+            _fix_zip_names(z)
             z.extractall(tmp)
     # if the archive contains a single top folder, descend into it
     entries = [os.path.join(tmp, e) for e in os.listdir(tmp)]
@@ -143,7 +171,7 @@ def _guess_track(dirpath):
     return "غير محدد"
 
 
-def _bulk_upsert(db, model, rows, index_elements, update_cols, chunk=500):
+def _bulk_upsert(db, model, rows, index_elements, update_cols, chunk=2000):
     """Batched INSERT ... ON CONFLICT DO UPDATE. Works on SQLite and Postgres."""
     if not rows:
         return
@@ -244,6 +272,8 @@ def ingest_path(path, province_label=None, progress=None, workers=None):
         # A mid-iteration pool failure (e.g. BrokenProcessPool) propagates:
         # falling back here would re-apply results already accumulated and
         # double-count analytics / duplicate exam_nos in the upsert batches.
+        # NOTE: ordered ex.map is deliberate — unordered completion would make
+        # duplicate-school-code resolution (last write wins) nondeterministic.
         with executor as ex:
             for res in ex.map(_parse_school, jobs, chunksize=4):
                 apply_result(res)
