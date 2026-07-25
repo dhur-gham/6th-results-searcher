@@ -171,6 +171,12 @@ def _parse_school(job):
     sname = m.group(2).strip() if m else fname
     try:
         rows = parse_pdf(pdf_path)
+        # Per-student CPU work (name normalization + grades JSON) happens
+        # here in the parallel worker, not in the serial consumer — it was
+        # a measurable single-threaded tail on large provinces.
+        for r in rows:
+            r["name_norm"] = normalize_ar(r["name"])
+            r["grades_json"] = json.dumps(r["grades"], ensure_ascii=False)
         return (scode, sname, track, rows, None)
     except Exception as e:  # pragma: no cover - defensive
         return (scode, sname, track, None, f"{fname}: {e}")
@@ -211,11 +217,11 @@ def ingest_path(path, province_label=None, progress=None, workers=None):
             student_rows.append({
                 "exam_no": r["exam_no"],
                 "name": r["name"],
-                "name_norm": normalize_ar(r["name"]),
+                "name_norm": r["name_norm"],
                 "result": r["result"],
                 "total": r["total"],
                 "average": r["average"],
-                "grades_json": json.dumps(r["grades"], ensure_ascii=False),
+                "grades_json": r["grades_json"],
                 "province_code": pcode,
                 "school_code": scode,
             })

@@ -46,10 +46,15 @@ _INGEST_SEM = None
 
 def _ingest_semaphore():
     """Lazily create the ingest concurrency gate (bound to the running loop).
-    INGEST_CONCURRENCY jobs run at once (WAL + busy_timeout keep SQLite safe)."""
+
+    Default is 1: each job already parallelizes across all cores with its own
+    process pool, so running jobs side by side just oversubscribes the CPU
+    (3 jobs x 8 workers = 24 processes on a 4-vCPU box) — sequential jobs
+    finish a multi-province batch FASTER. Raise INGEST_CONCURRENCY only on
+    hosts with many spare cores."""
     global _INGEST_SEM
     if _INGEST_SEM is None:
-        n = max(1, int(os.environ.get("INGEST_CONCURRENCY", "3")))
+        n = max(1, int(os.environ.get("INGEST_CONCURRENCY", "1")))
         _INGEST_SEM = asyncio.Semaphore(n)
     return _INGEST_SEM
 
