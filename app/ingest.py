@@ -23,12 +23,14 @@ import argparse
 try:
     from .parse_pdf import parse_pdf
     from .glyph import normalize_ar
-    from .db import init_db, SessionLocal, Province, School, Student, save_province_stats
+    from .db import (init_db, SessionLocal, Province, School, Student,
+                     save_province_stats, bump_data_version, DATA_DIR)
     from . import analytics
 except ImportError:
     from parse_pdf import parse_pdf
     from glyph import normalize_ar
-    from db import init_db, SessionLocal, Province, School, Student, save_province_stats
+    from db import (init_db, SessionLocal, Province, School, Student,
+                    save_province_stats, bump_data_version, DATA_DIR)
     import analytics
 
 SCHOOL_RE = re.compile(r"^(\d+)[_\-\s]+(.+?)\.pdf$", re.IGNORECASE)
@@ -108,12 +110,40 @@ def _extract_rar(path, out):
     raise RuntimeError(f"RAR extraction failed ({last}).")
 
 
+def _fix_zip_names(z):
+    """Zips made by Windows store entry names in the OEM codepage without the
+    UTF-8 flag; zipfile then decodes them as cp437, turning Arabic school names
+    into mojibake. Recover the original bytes and re-decode (UTF-8 first, then
+    Arabic OEM cp720) when that yields Arabic text."""
+    for info in z.infolist():
+        if info.flag_bits & 0x800:      # entry already flagged UTF-8
+            continue
+        try:
+            raw = info.filename.encode("cp437")
+        except UnicodeEncodeError:      # not a cp437 round-trip -> leave as-is
+            continue
+        for enc in ("utf-8", "cp720"):
+            try:
+                fixed = raw.decode(enc)
+            except (UnicodeDecodeError, LookupError):
+                continue
+            if any("؀" <= ch <= "ۿ" for ch in fixed):
+                info.filename = fixed
+            break
+
+
 def _extract_archive(path):
-    tmp = tempfile.mkdtemp(prefix="ingest_")
+    # Extract inside DATA_DIR (the mounted volume), not the container-layer
+    # tmpfs: a 2 GB archive needs ~2x its size transiently, and the root FS
+    # is the wrong place to stage that.
+    tmp_root = os.path.join(DATA_DIR, "tmp")
+    os.makedirs(tmp_root, exist_ok=True)
+    tmp = tempfile.mkdtemp(prefix="ingest_", dir=tmp_root)
     if path.lower().endswith(".rar"):
         _extract_rar(path, tmp)
     else:
         with zipfile.ZipFile(path) as z:
+            _fix_zip_names(z)
             z.extractall(tmp)
     # if the archive contains a single top folder, descend into it
     entries = [os.path.join(tmp, e) for e in os.listdir(tmp)]
@@ -141,7 +171,7 @@ def _guess_track(dirpath):
     return "غير محدد"
 
 
-def _bulk_upsert(db, model, rows, index_elements, update_cols, chunk=500):
+def _bulk_upsert(db, model, rows, index_elements, update_cols, chunk=2000):
     """Batched INSERT ... ON CONFLICT DO UPDATE. Works on SQLite and Postgres."""
     if not rows:
         return
@@ -169,6 +199,12 @@ def _parse_school(job):
     sname = m.group(2).strip() if m else fname
     try:
         rows = parse_pdf(pdf_path)
+        # Per-student CPU work (name normalization + grades JSON) happens
+        # here in the parallel worker, not in the serial consumer — it was
+        # a measurable single-threaded tail on large provinces.
+        for r in rows:
+            r["name_norm"] = normalize_ar(r["name"])
+            r["grades_json"] = json.dumps(r["grades"], ensure_ascii=False)
         return (scode, sname, track, rows, None)
     except Exception as e:  # pragma: no cover - defensive
         return (scode, sname, track, None, f"{fname}: {e}")
@@ -193,55 +229,63 @@ def ingest_path(path, province_label=None, progress=None, workers=None):
     if workers is None:
         workers = int(os.environ.get("INGEST_WORKERS", "0")) or min(os.cpu_count() or 2, 8)
 
+    school_rows = {}   # scode -> dict
+    student_rows = []  # list of dicts
+    counters = analytics.blank()   # analytics accumulated student-by-student
+
+    def apply_result(res):
+        scode, sname, track, rows, err = res
+        if err:
+            stats["errors"].append(err)
+            return
+        school_rows[scode] = {"code": scode, "name": sname, "track": track,
+                              "province_code": pcode}
+        for r in rows:
+            analytics.accumulate(counters, r["result"], r["average"], r["grades"])
+            student_rows.append({
+                "exam_no": r["exam_no"],
+                "name": r["name"],
+                "name_norm": r["name_norm"],
+                "result": r["result"],
+                "total": r["total"],
+                "average": r["average"],
+                "grades_json": r["grades_json"],
+                "province_code": pcode,
+                "school_code": scode,
+            })
+        stats["schools"] += 1
+        stats["students"] += len(rows)
+        if progress:
+            progress(sname, len(rows))
+
+    # ---- Parse phase: NO session/transaction open. (A session here used to
+    # hold SQLite's write lock for the entire multi-minute parse, which is what
+    # made concurrent ingests die with "database is locked".)
+    executor = None
+    if workers > 1 and len(jobs) > 1:
+        try:
+            from concurrent.futures import ProcessPoolExecutor
+            executor = ProcessPoolExecutor(max_workers=workers)
+        except Exception:  # pool unavailable on this platform -> sequential
+            executor = None
+    if executor is not None:
+        # A mid-iteration pool failure (e.g. BrokenProcessPool) propagates:
+        # falling back here would re-apply results already accumulated and
+        # double-count analytics / duplicate exam_nos in the upsert batches.
+        # NOTE: ordered ex.map is deliberate — unordered completion would make
+        # duplicate-school-code resolution (last write wins) nondeterministic.
+        with executor as ex:
+            for res in ex.map(_parse_school, jobs, chunksize=4):
+                apply_result(res)
+    else:
+        for job in jobs:
+            apply_result(_parse_school(job))
+
+    # ---- Write phase: one short transaction. Province is upserted like the
+    # rest (get-then-insert raced when two jobs ingested the same new province).
     with SessionLocal() as db:
-        prov = db.get(Province, pcode)
-        if not prov:
-            prov = Province(code=pcode, name=pname)
-            db.add(prov)
-            db.flush()
-
-        school_rows = {}   # scode -> dict
-        student_rows = []  # list of dicts
-        counters = analytics.blank()   # analytics accumulated student-by-student
-
-        def apply_result(res):
-            scode, sname, track, rows, err = res
-            if err:
-                stats["errors"].append(err)
-                return
-            school_rows[scode] = {"code": scode, "name": sname, "track": track,
-                                   "province_code": pcode}
-            for r in rows:
-                analytics.accumulate(counters, r["result"], r["average"], r["grades"])
-                student_rows.append({
-                    "exam_no": r["exam_no"],
-                    "name": r["name"],
-                    "name_norm": normalize_ar(r["name"]),
-                    "result": r["result"],
-                    "total": r["total"],
-                    "average": r["average"],
-                    "grades_json": json.dumps(r["grades"], ensure_ascii=False),
-                    "province_code": pcode,
-                    "school_code": scode,
-                })
-            stats["schools"] += 1
-            stats["students"] += len(rows)
-            if progress:
-                progress(sname, len(rows))
-
-        if workers > 1 and len(jobs) > 1:
-            try:
-                from concurrent.futures import ProcessPoolExecutor
-                with ProcessPoolExecutor(max_workers=workers) as ex:
-                    for res in ex.map(_parse_school, jobs, chunksize=4):
-                        apply_result(res)
-            except Exception:  # pool unavailable -> sequential fallback
-                for job in jobs:
-                    apply_result(_parse_school(job))
-        else:
-            for job in jobs:
-                apply_result(_parse_school(job))
-
+        _bulk_upsert(db, Province, [{"code": pcode, "name": pname}],
+                     ["code"], ["name"])
         # Bulk upsert (one batched statement per chunk) instead of per-row I/O.
         _bulk_upsert(db, School, list(school_rows.values()),
                      ["province_code", "code"], ["name", "track"])
@@ -253,6 +297,7 @@ def ingest_path(path, province_label=None, progress=None, workers=None):
     # Persist this province's analytics counters (overall is merged on read).
     counters["schools"] = len(school_rows)
     save_province_stats(pcode, pname, counters)
+    bump_data_version()   # tell every process to drop its in-process caches
 
     if cleanup:
         import shutil
