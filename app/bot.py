@@ -61,12 +61,47 @@ def _ingest_semaphore():
 
 async def _ingest_job(bot, chat_id, target, province_label, tmp_path):
     """Background ingest job: runs concurrently with other jobs (bounded by the
-    semaphore), does the CPU/DB work off the event loop, reports when done."""
+    semaphore), does the CPU/DB work off the event loop, reports when done.
+
+    While parsing, a status message is edited in place (rate-limited) so the
+    admin can tell a slow ingest from a hung one."""
     sem = _ingest_semaphore()
     try:
         async with sem:
             t0 = time.monotonic()
-            stats = await asyncio.to_thread(ingest_path, target, province_label)
+
+            status_msg = None
+            try:
+                status_msg = await bot.send_message(
+                    chat_id, f"⏳ «{province_label}» بدأت المعالجة...")
+            except Exception:   # progress is best-effort, never fail the job
+                pass
+
+            loop = asyncio.get_running_loop()
+            done = {"schools": 0, "students": 0}
+            last_edit = [0.0]
+
+            def _progress(_school_name, n_students):
+                # Called from the ingest worker thread for every parsed school.
+                done["schools"] += 1
+                done["students"] += n_students
+                now = time.monotonic()
+                if status_msg is None or now - last_edit[0] < 5:
+                    return
+                last_edit[0] = now
+                text = (f"⏳ «{province_label}»\n"
+                        f"المدارس: {done['schools']} — الطلاب: {done['students']}")
+
+                async def _edit():
+                    try:
+                        await status_msg.edit_text(text)
+                    except Exception:   # rate-limited / message unchanged
+                        pass
+
+                asyncio.run_coroutine_threadsafe(_edit(), loop)
+
+            stats = await asyncio.to_thread(
+                ingest_path, target, province_label, _progress)
             dt = time.monotonic() - t0
         _clear_query_caches()  # new data -> drop cached lookups/counts
         await bot.send_message(
