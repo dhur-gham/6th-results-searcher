@@ -63,6 +63,7 @@ async def _ingest_job(bot, chat_id, target, province_label, tmp_path):
             t0 = time.monotonic()
             stats = await asyncio.to_thread(ingest_path, target, province_label)
             dt = time.monotonic() - t0
+        _clear_query_caches()  # new data -> drop cached lookups/counts
         await bot.send_message(
             chat_id,
             f"✅ «{province_label}»\n"
@@ -90,15 +91,38 @@ except ImportError:  # pragma: no cover - sqlalchemy is a hard dep of db.py
 
 PAGE_SIZE = 8   # results shown per page in name-search (paginated, not capped)
 
+# In-process query caches. Results are immutable after ingest, so entries are
+# valid for the process lifetime; _clear_query_caches() runs after ingest/reset.
+# Bounded: when a cache hits the cap it is simply cleared (dataset is small
+# enough that refilling is cheap, and this keeps the code trivial).
+_CACHE_CAP = 200_000
+_exam_cache = {}    # exam_no -> dict | None (negative lookups cached too)
+_count_cache = {}   # (normalized phrase, province) -> total match count
+
+
+def _cache_put(cache: dict, key, value):
+    if len(cache) >= _CACHE_CAP:
+        cache.clear()
+    cache[key] = value
+
+
+def _clear_query_caches():
+    _exam_cache.clear()
+    _count_cache.clear()
+
 
 def lookup_exam_no(exam_no: str):
     """Exact primary-key lookup. Returns Student.to_dict() or None."""
     exam_no = (exam_no or "").strip()
     if not exam_no:
         return None
+    if exam_no in _exam_cache:
+        return _exam_cache[exam_no]
     with SessionLocal() as db:
         st = db.get(Student, exam_no)
-        return st.to_dict() if st else None
+        found = st.to_dict() if st else None
+    _cache_put(_exam_cache, exam_no, found)
+    return found
 
 
 def search_by_name(name: str, province: str | None = None,
@@ -114,15 +138,21 @@ def search_by_name(name: str, province: str | None = None,
     if not tokens:
         return [], 0
     phrase = " ".join(tokens)
+    count_key = (phrase, province or "")
     with SessionLocal() as db:
         base = select(Student)
         for t in tokens:
             base = base.where(Student.name_norm.like(f"%{t}%"))
         if province:
             base = base.where(Student.province_code == province)
-        total = db.execute(
-            select(func.count()).select_from(base.subquery())
-        ).scalar() or 0
+        # The exact count is the expensive half of the search — cache it so
+        # page navigation (and repeated identical queries) don't re-count.
+        total = _count_cache.get(count_key)
+        if total is None:
+            total = db.execute(
+                select(func.count()).select_from(base.subquery())
+            ).scalar() or 0
+            _cache_put(_count_cache, count_key, total)
         # Relevance: exact phrase, then phrase-prefix, then phrase-substring,
         # then the rest — each tier alphabetized.
         rank = case(
@@ -315,7 +345,7 @@ def build_application(token: str):
             )
         elif data == "mode:name":
             # show provinces to pick from
-            provs = list_provinces()
+            provs = await asyncio.to_thread(list_provinces)
             buttons = [
                 [InlineKeyboardButton(name, callback_data=f"prov:{code}")]
                 for code, name in provs
@@ -342,7 +372,7 @@ def build_application(token: str):
         query = update.callback_query
         await query.answer()
         exam_no = (query.data or "res:").split("res:", 1)[1]
-        d = lookup_exam_no(exam_no)
+        d = await asyncio.to_thread(lookup_exam_no, exam_no)
         if d:
             await query.message.reply_text(format_card(d), parse_mode=ParseMode.HTML)
         else:
@@ -382,7 +412,8 @@ def build_application(token: str):
         sending a new one."""
         context.user_data[SEARCH_Q] = q
         context.user_data[SEARCH_PROV] = prov
-        results, total = search_by_name(q, province=prov, offset=offset, limit=PAGE_SIZE)
+        results, total = await asyncio.to_thread(
+            search_by_name, q, province=prov, offset=offset, limit=PAGE_SIZE)
         if total == 0:
             await message.reply_text(
                 "❌ لم يتم العثور على نتائج بهذا الاسم. جرّب /start مرة أخرى.",
@@ -426,7 +457,7 @@ def build_application(token: str):
         # Auto-detect: a long digit string => exam number lookup.
         digits = text.replace(" ", "")
         if digits.isdigit() and len(digits) >= 5 and not context.user_data.get(MODE_NAME):
-            d = lookup_exam_no(digits)
+            d = await asyncio.to_thread(lookup_exam_no, digits)
             if d:
                 await update.effective_message.reply_text(
                     format_card(d), parse_mode=ParseMode.HTML
@@ -447,7 +478,7 @@ def build_application(token: str):
             return
 
         # Fallback: treat any other input as a name search across all provinces.
-        _, total = search_by_name(text, offset=0, limit=1)
+        _, total = await asyncio.to_thread(search_by_name, text, offset=0, limit=1)
         if total == 0:
             await update.effective_message.reply_text(
                 "لم أفهم طلبك. استخدم /start للبدء، أو أرسل رقمك الامتحاني.",
@@ -535,7 +566,7 @@ def build_application(token: str):
         return counters, overall
 
     async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        counters, overall = _load_analytics()
+        counters, overall = await asyncio.to_thread(_load_analytics)
         if not counters or overall["students"] == 0:
             await update.effective_message.reply_text(
                 "لا توجد بيانات بعد. أرسل نتائج المحافظات أولًا.")
@@ -559,7 +590,7 @@ def build_application(token: str):
         query = update.callback_query
         await query.answer()
         code = (query.data or "stats:").split("stats:", 1)[1]
-        for (c, name, cnt) in load_province_counters():
+        for (c, name, cnt) in await asyncio.to_thread(load_province_counters):
             if c == code:
                 await query.message.reply_text(
                     _fmt_province(name, analytics.derive(cnt)),
@@ -578,10 +609,14 @@ def build_application(token: str):
             await update.effective_message.reply_text("🚫 هذه الميزة للمشرفين فقط.")
             return
         # show current totals so the admin knows what they're about to erase
-        with SessionLocal() as db:
-            n_stu = db.execute(select(func.count(Student.exam_no))).scalar() or 0
-            n_sch = db.execute(select(func.count()).select_from(School)).scalar() or 0
-            n_prov = db.execute(select(func.count()).select_from(Province)).scalar() or 0
+        def _totals():
+            with SessionLocal() as db:
+                return (
+                    db.execute(select(func.count(Student.exam_no))).scalar() or 0,
+                    db.execute(select(func.count()).select_from(School)).scalar() or 0,
+                    db.execute(select(func.count()).select_from(Province)).scalar() or 0,
+                )
+        n_stu, n_sch, n_prov = await asyncio.to_thread(_totals)
         kb = InlineKeyboardMarkup([[
             InlineKeyboardButton("🗑 نعم، احذف الكل", callback_data="reset:yes"),
             InlineKeyboardButton("إلغاء", callback_data="reset:no"),
@@ -607,6 +642,7 @@ def build_application(token: str):
         await query.edit_message_text("⏳ جارٍ حذف جميع البيانات...")
         try:
             counts = await asyncio.to_thread(reset_all)
+            _clear_query_caches()  # data gone -> cached hits would be stale
             await query.edit_message_text(
                 "✅ تم حذف جميع البيانات. النظام جاهز لمرحلة جديدة.\n\n"
                 f"المحذوف — المحافظات: {counts['provinces']}، "
@@ -615,7 +651,11 @@ def build_application(token: str):
             log.exception("reset failed")
             await query.edit_message_text(f"❌ فشل الحذف: {e}")
 
-    builder = Application.builder().token(token)
+    # PTB's default is to process updates STRICTLY SEQUENTIALLY — one slow
+    # search would queue every other user. Handle updates concurrently; DB
+    # work runs off the event loop via asyncio.to_thread in the handlers.
+    bot_concurrency = max(1, int(os.environ.get("BOT_CONCURRENCY", "256")))
+    builder = Application.builder().token(token).concurrent_updates(bot_concurrency)
     # Optional local Bot API server (no 20 MB download cap, up to 2 GB uploads,
     # and files arrive as a local path — no download round-trip). Env-gated so
     # the default (public api.telegram.org) is unchanged.

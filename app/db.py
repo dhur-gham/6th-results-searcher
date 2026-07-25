@@ -118,6 +118,25 @@ class Student(Base):
 
 def init_db():
     Base.metadata.create_all(engine)
+    # Postgres: trigram GIN index so substring name search (LIKE '%token%')
+    # is indexed instead of a full-table scan. No-op on SQLite. Extension
+    # creation needs sufficient privileges; if it fails we log the manual SQL
+    # and keep running (search still works, just unindexed).
+    if engine.dialect.name == "postgresql":
+        from sqlalchemy import text
+        try:
+            with engine.begin() as conn:
+                conn.execute(text("CREATE EXTENSION IF NOT EXISTS pg_trgm"))
+                conn.execute(text(
+                    "CREATE INDEX IF NOT EXISTS ix_students_name_norm_trgm "
+                    "ON students USING gin (name_norm gin_trgm_ops)"))
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).warning(
+                "could not create pg_trgm index (%s); create it manually:\n"
+                "  CREATE EXTENSION IF NOT EXISTS pg_trgm;\n"
+                "  CREATE INDEX IF NOT EXISTS ix_students_name_norm_trgm\n"
+                "    ON students USING gin (name_norm gin_trgm_ops);", e)
 
 
 def reset_all():
