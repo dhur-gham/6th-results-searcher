@@ -127,23 +127,49 @@
   tabName.addEventListener("click", function () { setMode("name"); });
 
   // ---- populate provinces ----
-  async function loadProvinces() {
+  function fillProvinces(list) {
     provinceSel.innerHTML = "";
-    provinceSel.appendChild(new Option("جارٍ التحميل…", ""));
-    provinceSel.disabled = true;
+    provinceSel.appendChild(new Option("اختر المحافظة", ""));
+    list.forEach(function (p) {
+      var label = p.school_count != null ? p.name + " (" + p.school_count + " مدرسة)" : p.name;
+      provinceSel.appendChild(new Option(label, p.code));
+    });
+    provinceSel.disabled = false;
+  }
+
+  // ---- empty-state gate ----
+  // While the DB has no provinces (fresh deploy or right after a wipe, before the
+  // admin uploads cities), hide the search entirely and show a waiting screen that
+  // auto-polls, so the search appears on its own once data lands — no refresh.
+  var _bootTimer = null;
+  function showWaiting(isError) {
+    var main = document.querySelector(".wrap");
+    if (main) main.classList.add("empty-mode");
+    clearOut();
+    var box = el("div", "state waiting");
+    box.appendChild(el("div", "spinner"));
+    box.appendChild(el("p", "state-text",
+      isError ? "تعذّر الاتصال بالخادم. سيُعاد المحاولة تلقائيًا…"
+              : "النتائج قيد التحضير… سيظهر البحث تلقائيًا عند اكتمال رفع النتائج."));
+    box.appendChild(el("p", "state-sub", "يتم الآن تجهيز البيانات من قبل المشرف."));
+    out.appendChild(box);
+  }
+  function showReady(list) {
+    var main = document.querySelector(".wrap");
+    if (main) main.classList.remove("empty-mode");
+    fillProvinces(list);
+    clearOut();
+    setMode("exam");
+  }
+  async function boot() {
     try {
       var list = await getJSON(api("/api/provinces"));
-      provinceSel.innerHTML = "";
-      provinceSel.appendChild(new Option("اختر المحافظة", ""));
-      list.forEach(function (p) {
-        var label = p.school_count != null ? p.name + " (" + p.school_count + " مدرسة)" : p.name;
-        provinceSel.appendChild(new Option(label, p.code));
-      });
-      provinceSel.disabled = false;
+      if (!list.length) { showWaiting(false); _bootTimer = setTimeout(boot, 15000); return; }
+      if (_bootTimer) { clearTimeout(_bootTimer); _bootTimer = null; }
+      showReady(list);
     } catch (err) {
-      provinceSel.innerHTML = "";
-      provinceSel.appendChild(new Option("تعذّر تحميل المحافظات", ""));
-      provinceSel.disabled = false;
+      showWaiting(true);
+      _bootTimer = setTimeout(boot, 15000);
     }
   }
 
@@ -354,6 +380,5 @@
   });
 
   // ---- init ----
-  setMode("exam");
-  loadProvinces();
+  boot();
 })();

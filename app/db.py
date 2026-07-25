@@ -143,10 +143,13 @@ def reset_all():
         db.execute(delete(Province))
         db.execute(delete(ProvinceStats))
         db.commit()
-    # reclaim space on SQLite (no-op-ish on Postgres autovacuum)
+    # reclaim space on SQLite: checkpoint+truncate the WAL first (otherwise a big
+    # stale WAL lingers and VACUUM can't fully shrink the file), then VACUUM.
     if DATABASE_URL.startswith("sqlite"):
         with engine.connect() as conn:
+            conn.exec_driver_sql("PRAGMA wal_checkpoint(TRUNCATE)")
             conn.exec_driver_sql("VACUUM")
+            conn.exec_driver_sql("PRAGMA wal_checkpoint(TRUNCATE)")
     return counts
 
 

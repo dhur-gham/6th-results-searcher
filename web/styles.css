@@ -309,6 +309,12 @@ select{appearance:none;padding-inline-start:40px}
 }
 .rc-back svg{width:16px;height:16px;transform:scaleX(-1)}
 
+/* ===== Empty state (no data yet — waiting for the bot to load results) ===== */
+.wrap.empty-mode .search-card{display:none}
+.state.waiting{gap:14px}
+.state.waiting .spinner{width:34px;height:34px}
+.state-sub{margin:2px 0 0;color:var(--muted);font-size:.85rem}
+
 /* ===== Collapsible search card ===== */
 /* The toggle handle only appears once the card is collapsed (after a search). */
 .search-toggle{display:none}
