@@ -23,11 +23,11 @@ import asyncio
 import logging
 
 try:
-    from .db import init_db, SessionLocal, Province, School, Student
+    from .db import init_db, reset_all, SessionLocal, Province, School, Student
     from .glyph import normalize_ar
     from .ingest import ingest_path
 except ImportError:  # allow running as a top-level module too
-    from db import init_db, SessionLocal, Province, School, Student
+    from db import init_db, reset_all, SessionLocal, Province, School, Student
     from glyph import normalize_ar
     from ingest import ingest_path
 
@@ -479,6 +479,54 @@ def build_application(token: str):
         await update.effective_message.reply_text(
             f"📥 «{province_label}» أُضيفت للمعالجة في الخلفية.")
 
+    async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Admin: wipe ALL data to start a fresh stage. Two-step confirm."""
+        user = update.effective_user
+        if not ADMIN_IDS:
+            await update.effective_message.reply_text(
+                "🚫 هذه الميزة غير مُفعّلة (لم يتم ضبط ADMIN_IDS).")
+            return
+        if not user or user.id not in ADMIN_IDS:
+            await update.effective_message.reply_text("🚫 هذه الميزة للمشرفين فقط.")
+            return
+        # show current totals so the admin knows what they're about to erase
+        with SessionLocal() as db:
+            n_stu = db.execute(select(func.count(Student.exam_no))).scalar() or 0
+            n_sch = db.execute(select(func.count()).select_from(School)).scalar() or 0
+            n_prov = db.execute(select(func.count()).select_from(Province)).scalar() or 0
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("🗑 نعم، احذف الكل", callback_data="reset:yes"),
+            InlineKeyboardButton("إلغاء", callback_data="reset:no"),
+        ]])
+        await update.effective_message.reply_text(
+            "⚠️ <b>حذف جميع البيانات نهائيًا</b>\n\n"
+            f"المحافظات: {n_prov}\nالمدارس: {n_sch}\nالطلاب: {n_stu}\n\n"
+            "سيبدأ النظام فارغًا (مثلاً لرفع نتائج الدور الثاني). "
+            "هذا الإجراء لا يمكن التراجع عنه.",
+            parse_mode=ParseMode.HTML, reply_markup=kb)
+
+    async def on_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        query = update.callback_query
+        await query.answer()
+        user = update.effective_user
+        # re-check admin on the confirm tap (buttons can be forwarded)
+        if not ADMIN_IDS or not user or user.id not in ADMIN_IDS:
+            await query.edit_message_text("🚫 هذه الميزة للمشرفين فقط.")
+            return
+        if (query.data or "") == "reset:no":
+            await query.edit_message_text("❎ تم الإلغاء. لم يتم حذف أي شيء.")
+            return
+        await query.edit_message_text("⏳ جارٍ حذف جميع البيانات...")
+        try:
+            counts = await asyncio.to_thread(reset_all)
+            await query.edit_message_text(
+                "✅ تم حذف جميع البيانات. النظام جاهز لمرحلة جديدة.\n\n"
+                f"المحذوف — المحافظات: {counts['provinces']}، "
+                f"المدارس: {counts['schools']}، الطلاب: {counts['students']}")
+        except Exception as e:  # pragma: no cover - defensive
+            log.exception("reset failed")
+            await query.edit_message_text(f"❌ فشل الحذف: {e}")
+
     builder = Application.builder().token(token)
     # Optional local Bot API server (no 20 MB download cap, up to 2 GB uploads,
     # and files arrive as a local path — no download round-trip). Env-gated so
@@ -491,6 +539,8 @@ def build_application(token: str):
     application = builder.build()
     application.add_handler(CommandHandler("start", cmd_start))
     application.add_handler(CommandHandler("help", cmd_help))
+    application.add_handler(CommandHandler("reset", cmd_reset))
+    application.add_handler(CallbackQueryHandler(on_reset, pattern=r"^reset:"))
     application.add_handler(CallbackQueryHandler(on_menu, pattern=r"^mode:"))
     application.add_handler(CallbackQueryHandler(on_province, pattern=r"^prov:"))
     application.add_handler(CallbackQueryHandler(on_result_pick, pattern=r"^res:"))

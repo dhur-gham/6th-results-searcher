@@ -22,11 +22,11 @@ from sqlalchemy import select, func, case
 from sqlalchemy.orm import Session
 
 try:
-    from .db import init_db, SessionLocal, Province, School, Student
+    from .db import init_db, reset_all, SessionLocal, Province, School, Student
     from .glyph import normalize_ar
     from .ingest import ingest_path
 except ImportError:  # allow running as a top-level module too
-    from db import init_db, SessionLocal, Province, School, Student
+    from db import init_db, reset_all, SessionLocal, Province, School, Student
     from glyph import normalize_ar
     from ingest import ingest_path
 
@@ -220,6 +220,18 @@ async def ingest(
             os.remove(tmp_path)
         except OSError:
             pass
+
+
+@app.post("/api/reset")
+def reset(authorization: str | None = Header(None)):
+    """Wipe ALL data (provinces/schools/students) to start a fresh stage.
+    Irreversible. Protected by the same Bearer ADMIN_TOKEN as ingest."""
+    expected = f"Bearer {ADMIN_TOKEN}"
+    if authorization != expected:
+        raise HTTPException(status_code=401, detail="unauthorized")
+    counts = reset_all()
+    _clear_caches()
+    return {"cleared": counts}
 
 
 # ---------------------------------------------------------------------------

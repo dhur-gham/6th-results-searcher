@@ -110,6 +110,35 @@ def init_db():
     Base.metadata.create_all(engine)
 
 
+def reset_all():
+    """Delete ALL data (students -> schools -> provinces) and start fresh.
+
+    Irreversible. Used when a new results stage (e.g. الدور الثاني) replaces the
+    old dataset. Deletes in FK-safe order and returns the removed row counts.
+    Schema is kept (tables remain), so a subsequent ingest just refills them.
+    """
+    from sqlalchemy import delete, func
+    init_db()
+    with SessionLocal() as db:
+        counts = {
+            "students": db.execute(select(func.count(Student.exam_no))).scalar() or 0,
+            "schools": db.execute(
+                select(func.count()).select_from(School)).scalar() or 0,
+            "provinces": db.execute(
+                select(func.count()).select_from(Province)).scalar() or 0,
+        }
+        # children first to satisfy foreign keys
+        db.execute(delete(Student))
+        db.execute(delete(School))
+        db.execute(delete(Province))
+        db.commit()
+    # reclaim space on SQLite (no-op-ish on Postgres autovacuum)
+    if DATABASE_URL.startswith("sqlite"):
+        with engine.connect() as conn:
+            conn.exec_driver_sql("VACUUM")
+    return counts
+
+
 if __name__ == "__main__":
     init_db()
     print("initialized:", DATABASE_URL)
