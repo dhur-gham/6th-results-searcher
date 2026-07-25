@@ -1,0 +1,5 @@
+# Keep shell scripts and configs LF so they run correctly in Linux containers.
+*.sh   text eol=lf
+Caddyfile text eol=lf
+Dockerfile text eol=lf
+*.yml  text eol=lf
