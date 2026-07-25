@@ -12,6 +12,7 @@ Runs with zero required env vars against the existing populated SQLite DB:
 import os
 import time
 import shutil
+import asyncio
 import tempfile
 from functools import lru_cache
 
@@ -312,10 +313,17 @@ async def ingest(
 
     suffix = os.path.splitext(file.filename or "upload.zip")[1] or ".zip"
     fd, tmp_path = tempfile.mkstemp(suffix=suffix)
-    try:
+
+    # The upload copy and the whole ingest are blocking work: run them in a
+    # worker thread so this worker's event loop keeps serving reads (an ingest
+    # used to freeze 1/8 of API capacity for its full duration).
+    def _save_and_ingest():
         with os.fdopen(fd, "wb") as out:
             shutil.copyfileobj(file.file, out)
-        stats = ingest_path(tmp_path, province_label=province)
+        return ingest_path(tmp_path, province_label=province)
+
+    try:
+        stats = await asyncio.to_thread(_save_and_ingest)
         _clear_caches()
         return stats
     finally:
