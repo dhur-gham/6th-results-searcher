@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="theme-color" content="#0f766e" media="(prefers-color-scheme: light)" />
+  <meta name="theme-color" content="#0b1220" media="(prefers-color-scheme: dark)" />
+  <title>نتائج السادس — البحث السريع</title>
+  <meta name="description" content="البحث السريع عن نتائج الصف السادس الإعدادي في العراق بالرقم الامتحاني أو بالاسم." />
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div class="bg-orbs" aria-hidden="true"><span></span><span></span></div>
+
+  <main class="wrap">
+    <header class="hero">
+      <div class="logo" aria-hidden="true">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M22 10 12 4 2 10l10 6 10-6Z"/><path d="M6 12v5c0 1 2.7 3 6 3s6-2 6-3v-5"/>
+        </svg>
+      </div>
+      <h1>نتائج السادس الإعدادي</h1>
+      <p class="subtitle">البحث السريع عن النتائج بالرقم الامتحاني أو بالاسم</p>
+    </header>
+
+    <section class="card search-card" aria-label="نموذج البحث">
+      <div class="toggle" role="tablist" aria-label="طريقة البحث">
+        <button id="tab-exam" class="toggle-btn active" role="tab" aria-selected="true" data-mode="exam">بالرقم الامتحاني</button>
+        <button id="tab-name" class="toggle-btn" role="tab" aria-selected="false" data-mode="name">بالاسم</button>
+        <span class="toggle-slider" aria-hidden="true"></span>
+      </div>
+
+      <!-- By exam number -->
+      <form id="form-exam" class="pane" novalidate>
+        <label class="field">
+          <span class="field-label">الرقم الامتحاني</span>
+          <input id="exam-no" name="exam_no" type="text" inputmode="numeric" autocomplete="off"
+                 pattern="[0-9]*" placeholder="مثال: 12345678" enterkeyhint="search" />
+        </label>
+        <button type="submit" class="btn-primary">
+          <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg>
+          <span>بحث</span>
+        </button>
+      </form>
+
+      <!-- By name -->
+      <form id="form-name" class="pane hidden" novalidate>
+        <label class="field">
+          <span class="field-label">المحافظة</span>
+          <div class="select-wrap">
+            <select id="province" name="province" required></select>
+          </div>
+        </label>
+        <label class="field">
+          <span class="field-label">المدرسة <span class="opt">(اختياري)</span></span>
+          <div class="select-wrap">
+            <select id="school" name="school" disabled>
+              <option value="">كل المدارس</option>
+            </select>
+          </div>
+        </label>
+        <label class="field">
+          <span class="field-label">اسم الطالب</span>
+          <input id="name" name="name" type="text" autocomplete="off" placeholder="اكتب الاسم أو جزءًا منه" enterkeyhint="search" />
+        </label>
+        <button type="submit" class="btn-primary">
+          <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg>
+          <span>بحث</span>
+        </button>
+      </form>
+    </section>
+
+    <!-- Status / results region -->
+    <section id="output" class="output" aria-live="polite" aria-busy="false"></section>
+  </main>
+
+  <footer class="foot">
+    <p>خدمة استعلام غير رسمية — للتحقق النهائي راجع الجهات الرسمية.</p>
+  </footer>
+
+  <!-- Templates -->
+  <template id="tpl-spinner">
+    <div class="state">
+      <div class="spinner" aria-hidden="true"></div>
+      <p class="state-text">جارٍ البحث…</p>
+    </div>
+  </template>
+
+  <template id="tpl-message">
+    <div class="state">
+      <div class="state-emoji" aria-hidden="true"></div>
+      <p class="state-text"></p>
+    </div>
+  </template>
+
+  <script src="app.js" defer></script>
+</body>
+</html>

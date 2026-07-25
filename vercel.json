@@ -1,0 +1,10 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "comment": "Hosts ONLY the static web/ frontend on Vercel. The API + bot run elsewhere (Railway/Fly/any container host). Set window.API_BASE in web/ to your deployed API origin.",
+  "buildCommand": null,
+  "outputDirectory": "web",
+  "cleanUrls": true,
+  "rewrites": [
+    { "source": "/(.*)", "destination": "/index.html" }
+  ]
+}

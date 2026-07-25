@@ -1,0 +1,20 @@
+# Automatic HTTPS via Let's Encrypt. Caddy fetches + renews the certificate for
+# $DOMAIN by itself — no manual cert steps.
+#
+# Cloudflare note: set the Cloudflare SSL/TLS mode to "Full (strict)" so the
+# orange-cloud proxy talks to Caddy over the valid cert Caddy provisions.
+
+{$DOMAIN} {
+	encode gzip zstd
+
+	# Everything goes to the API (which also serves the static web/ frontend at /).
+	reverse_proxy api:8000
+
+	# Security headers
+	header {
+		X-Content-Type-Options nosniff
+		X-Frame-Options SAMEORIGIN
+		Referrer-Policy strict-origin-when-cross-origin
+		-Server
+	}
+}

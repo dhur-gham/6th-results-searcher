@@ -1,0 +1,54 @@
+# Default `docker compose up` (no .env needed) brings up api + bot on SQLite.
+# The bot exits cleanly if TELEGRAM_TOKEN is empty, so this is safe out of the box.
+#
+# To use Postgres instead of SQLite, uncomment the `postgres` service and set
+# DATABASE_URL in .env (see .env.example), then `docker compose --profile pg up`.
+
+services:
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/app/data
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      DATA_DIR: /app/data
+    restart: unless-stopped
+
+  bot:
+    build: .
+    command: ["python", "-m", "app.bot"]
+    volumes:
+      - ./data:/app/data
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      DATA_DIR: /app/data
+    depends_on:
+      - api
+    # Bot self-disables (exit 0) when TELEGRAM_TOKEN is unset; restart keeps the
+    # API-only setup from spamming, while a configured token stays running.
+    restart: unless-stopped
+
+  # --- Optional Postgres (profile-gated; off by default) --------------------
+  # Enable with: docker compose --profile pg up
+  # Then set in .env:  DATABASE_URL=postgresql+psycopg://results:results@postgres:5432/results
+  postgres:
+    image: postgres:16-alpine
+    profiles: ["pg"]
+    environment:
+      POSTGRES_USER: results
+      POSTGRES_PASSWORD: results
+      POSTGRES_DB: results
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    restart: unless-stopped
+
+volumes:
+  pgdata:

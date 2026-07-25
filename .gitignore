@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Virtualenvs
+.venv/
+venv/
+env/
+
+# Environment / secrets
+.env
+
+# Data (keep the folder, ignore the DBs and temp)
+data/*.db
+data/*.sqlite
+data/*.sqlite3
+
+# Production runtime dirs (created on the VPS)
+backups/
+citydata/
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store

@@ -1,0 +1,9 @@
+fastapi
+uvicorn[standard]
+python-multipart
+pymupdf
+fonttools
+sqlalchemy
+python-telegram-bot>=21
+psycopg[binary]
+gunicorn

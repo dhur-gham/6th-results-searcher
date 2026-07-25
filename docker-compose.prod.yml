@@ -1,0 +1,113 @@
+# Production stack for a single VPS (e.g. Contabo 4 vCPU / 8 GB / 100 GB SSD).
+#
+#   Cloudflare (free)  ->  Caddy (auto-HTTPS)  ->  API (gunicorn, 8 workers)
+#                                              ->  Telegram bot
+#                          both  ->  Postgres  (data on the SSD)
+#                          backup ->  nightly pg_dump
+#
+# Usage on the server:
+#   cp .env.example .env      # then edit: DOMAIN, POSTGRES_PASSWORD, TELEGRAM_TOKEN,
+#                             #            ADMIN_TOKEN, CACHE_MODE=prod, DATABASE_URL
+#   docker compose -f docker-compose.prod.yml up -d --build
+#
+# First data load (once containers are up):
+#   docker compose -f docker-compose.prod.yml exec api python -m app.ingest /data/31_بغداد.zip
+#   (put the zip on the host and mount ./citydata; see the `citydata` volume below)
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-results}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-results}
+      POSTGRES_DB: ${POSTGRES_DB:-results}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-results}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  api:
+    build: .
+    command:
+      - gunicorn
+      - app.api:app
+      - -k
+      - uvicorn.workers.UvicornWorker
+      - -w
+      - "8"                       # 8 workers ~ matches 4 cores under read load
+      - -b
+      - "0.0.0.0:8000"
+      - --timeout
+      - "60"
+      - --access-logfile
+      - "-"
+    environment:
+      DATABASE_URL: ${DATABASE_URL}
+      CACHE_MODE: ${CACHE_MODE:-prod}
+      CACHE_MAX_AGE: ${CACHE_MAX_AGE:-3600}
+      ADMIN_TOKEN: ${ADMIN_TOKEN}
+      DATA_DIR: /app/data
+    volumes:
+      - ./data:/app/data
+      - ./citydata:/data            # drop city .zip/folders here to ingest
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  bot:
+    build: .
+    command: ["python", "-m", "app.bot"]
+    environment:
+      DATABASE_URL: ${DATABASE_URL}
+      TELEGRAM_TOKEN: ${TELEGRAM_TOKEN}
+      ADMIN_IDS: ${ADMIN_IDS}
+      DATA_DIR: /app/data
+    volumes:
+      - ./data:/app/data
+      - ./citydata:/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  caddy:
+    image: caddy:2-alpine
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      DOMAIN: ${DOMAIN}
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - api
+    restart: unless-stopped
+
+  # Nightly pg_dump to ./backups (keeps last 14). DB is tiny, so this is cheap.
+  backup:
+    image: postgres:16-alpine
+    entrypoint: ["/bin/sh", "/backup.sh"]
+    environment:
+      PGUSER: ${POSTGRES_USER:-results}
+      PGPASSWORD: ${POSTGRES_PASSWORD:-results}
+      PGDATABASE: ${POSTGRES_DB:-results}
+      PGHOST: postgres
+    volumes:
+      - ./deploy/backup.sh:/backup.sh:ro
+      - ./backups:/backups
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  caddy_data:
+  caddy_config:
