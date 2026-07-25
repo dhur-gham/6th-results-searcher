@@ -300,17 +300,18 @@ def build_application(token: str):
             await query.message.reply_text("لم يتم العثور على النتيجة.")
 
     def _results_keyboard(results, offset, total):
-        """One two-line button per result (name + 🗺️ province), then a nav row
-        (⬅️ السابق / صفحة X/Y / التالي ➡️) when there is more than one page."""
+        """Each result is a row of TWO buttons — name | 🗺️ province — (both open
+        the same card), then a nav row (⬅️ السابق / صفحة X/Y / التالي ➡️) when
+        there is more than one page."""
         buttons = []
         for d in results:
             name = d.get("name") or d.get("exam_no")
             prov_name = (d.get("school") or {}).get("province") or "—"
-            # a newline inside button text renders as a second line in Telegram
-            label = f"{name}\n🗺️ {prov_name}"
-            buttons.append(
-                [InlineKeyboardButton(label[:120], callback_data=f"res:{d['exam_no']}")]
-            )
+            exam = d["exam_no"]
+            buttons.append([
+                InlineKeyboardButton(name[:40], callback_data=f"res:{exam}"),
+                InlineKeyboardButton(f"🗺️ {prov_name}"[:40], callback_data=f"res:{exam}"),
+            ])
         pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
         cur = offset // PAGE_SIZE + 1
         if pages > 1:
@@ -325,9 +326,11 @@ def build_application(token: str):
             buttons.append(nav)
         return InlineKeyboardMarkup(buttons)
 
-    async def send_results_page(message, context, q, prov, offset):
+    async def send_results_page(message, context, q, prov, offset, edit=False):
         """Run the paginated search and render one page. A single exact hit is
-        shown as a full card; otherwise a paginated pick-list."""
+        shown as a full card; otherwise a paginated pick-list. When edit=True
+        (page navigation) the existing message is edited in place instead of
+        sending a new one."""
         context.user_data[SEARCH_Q] = q
         context.user_data[SEARCH_PROV] = prov
         results, total = search_by_name(q, province=prov, offset=offset, limit=PAGE_SIZE)
@@ -340,10 +343,15 @@ def build_application(token: str):
         if total == 1 and results:
             await message.reply_text(format_card(results[0]), parse_mode=ParseMode.HTML)
             return
-        await message.reply_text(
-            f"🔎 وجدت {total} نتيجة — اختر الاسم:",
-            reply_markup=_results_keyboard(results, offset, total),
-        )
+        text = f"🔎 وجدت {total} نتيجة — اختر الاسم:"
+        markup = _results_keyboard(results, offset, total)
+        if edit:
+            try:
+                await message.edit_text(text, reply_markup=markup)
+                return
+            except Exception:  # message unchanged / too old -> fall back to send
+                pass
+        await message.reply_text(text, reply_markup=markup)
 
     async def on_page(update: Update, context: ContextTypes.DEFAULT_TYPE):
         query = update.callback_query
@@ -359,7 +367,7 @@ def build_application(token: str):
             await query.message.reply_text("انتهت الجلسة. استخدم /start للبحث من جديد.")
             return
         prov = context.user_data.get(SEARCH_PROV)
-        await send_results_page(query.message, context, q, prov, offset)
+        await send_results_page(query.message, context, q, prov, offset, edit=True)
 
     async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = (update.effective_message.text or "").strip()
