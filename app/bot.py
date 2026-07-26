@@ -241,6 +241,14 @@ def list_provinces():
         return [(p.code, p.name) for p in rows]
 
 
+def has_data() -> bool:
+    """True once at least one province has been ingested. Mirrors the web
+    frontend's empty-state gate (web/app.js `boot()`), which hides search
+    until data exists."""
+    with SessionLocal() as db:
+        return db.execute(select(Province.code).limit(1)).first() is not None
+
+
 # ---------------------------------------------------------------------------
 # Arabic UI text + formatting.
 # ---------------------------------------------------------------------------
@@ -295,6 +303,91 @@ def format_card(d: dict) -> str:
             lines.append(f"{SUBJECT_EMOJI} {_esc(subject)}: <b>{_esc(grade)}</b>")
 
     return "\n".join(lines)
+
+
+PASS_MARK = 50   # web frontend colors: >=50 green, <50 red, "غ" gray
+
+
+def _rich_grade_row(subject, grade) -> str:
+    """One <tr> of the rich grades table. `grade` is int or the string "غ"."""
+    if isinstance(grade, int):
+        mark = "✅" if grade >= PASS_MARK else "❌"
+        val = f"<b>{grade}</b>" if grade >= PASS_MARK else str(grade)
+    else:  # absent
+        mark, val = "🚫", _esc(grade)
+    return (f"<tr><td>{_esc(subject)}</td>"
+            f'<td align="center">{val}</td>'
+            f'<td align="center">{mark}</td></tr>')
+
+
+def format_rich_card(d: dict) -> str:
+    """sendRichMessage (HTML-style) version of format_card: same info, but the
+    grades render as a real bordered table instead of emoji lines."""
+    school = d.get("school") or {}
+    result = (d.get("result") or "").strip()
+    status = f"✅ <b>{_esc(result)}</b>" if result else "ℹ️ <b>غير متوفر</b>"
+    avg = d.get("average")
+    total = d.get("total")
+
+    parts = [
+        f"<h3>👤 {_esc(d.get('name'))}</h3>",
+        f"<p>🔢 <b>الرقم الامتحاني:</b> <code>{_esc(d.get('exam_no'))}</code></p>",
+        "<blockquote>"
+        f"🏫 <b>المدرسة:</b> {_esc(school.get('name')) or '—'}<br>"
+        f"📚 <b>الفرع:</b> {_esc(school.get('track')) or '—'}<br>"
+        f"🗺️ <b>المحافظة:</b> {_esc(school.get('province')) or '—'}"
+        "</blockquote>",
+        f"<p>{status}</p>",
+    ]
+
+    grades = d.get("grades") or {}
+    rows = [_rich_grade_row(s, g) for s, g in grades.items()]
+    # summary rows at the bottom of the same table
+    avg_txt = _esc(avg) if avg is not None else "—"
+    total_txt = _esc(total) if total is not None else "—"
+    rows.append(f'<tr><td><b>المجموع</b></td>'
+                f'<td align="center"><b>{total_txt}</b></td><td></td></tr>')
+    rows.append(f'<tr><td><b>المعدل</b></td>'
+                f'<td align="center"><b>{avg_txt}</b></td><td></td></tr>')
+    parts.append(
+        "<table bordered striped><caption>📖 الدرجات</caption>"
+        "<tr><th>المادة</th><th>الدرجة</th><th>الحالة</th></tr>"
+        + "".join(rows) + "</table>")
+    return "".join(parts)
+
+
+# Flipped on the first definitive rejection of sendRichMessage (old Bot API
+# server / method not rolled out) so every later card skips straight to the
+# classic HTML fallback instead of paying a failed round-trip each time.
+_rich_send_disabled = False
+
+
+async def send_result_card(message, d: dict):
+    """Send a student result card, preferring a rich message (real table for
+    the grades) and falling back to the classic HTML card."""
+    global _rich_send_disabled
+    if not _rich_send_disabled:
+        try:
+            await message.get_bot().do_api_request(
+                "sendRichMessage",
+                api_kwargs={
+                    "chat_id": message.chat_id,
+                    "rich_message": {
+                        "html": format_rich_card(d),
+                        "skip_entity_detection": True,
+                    },
+                },
+            )
+            return
+        except Exception as e:
+            from telegram.error import BadRequest, EndPointNotFound
+            if isinstance(e, (EndPointNotFound, BadRequest)):
+                _rich_send_disabled = True
+                log.warning("sendRichMessage unavailable (%s) — "
+                            "falling back to classic HTML cards", e)
+            else:  # transient (network/timeout): fall back for this send only
+                log.warning("sendRichMessage failed (%s); using HTML fallback", e)
+    await message.reply_text(format_card(d), parse_mode="HTML")
 
 
 def _fmt_overall(derived, provinces_count):
@@ -353,6 +446,13 @@ WELCOME = (
     "🔤 البحث بالاسم — اختر المحافظة ثم أرسل الاسم."
 )
 
+# Same wording as the web empty-state gate (web/app.js showWaiting()).
+WAITING_MSG = (
+    "⏳ <b>النتائج قيد التحضير…</b>\n"
+    "سيظهر البحث تلقائيًا عند اكتمال رفع النتائج.\n\n"
+    "يتم الآن تجهيز البيانات من قبل المشرف."
+)
+
 # conversation state keys stored in context.user_data
 MODE_NAME = "awaiting_name"
 SELECTED_PROVINCE = "province"
@@ -391,6 +491,9 @@ def build_application(token: str):
 
     async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.clear()
+        if not await asyncio.to_thread(has_data):
+            await update.effective_message.reply_text(WAITING_MSG, parse_mode=ParseMode.HTML)
+            return
         await update.effective_message.reply_text(
             WELCOME, parse_mode=ParseMode.HTML, reply_markup=main_menu_kb()
         )
@@ -404,6 +507,9 @@ def build_application(token: str):
     async def on_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         query = update.callback_query
         await query.answer()
+        if not await asyncio.to_thread(has_data):
+            await query.message.reply_text(WAITING_MSG, parse_mode=ParseMode.HTML)
+            return
         data = query.data or ""
         if data == "mode:exam":
             context.user_data.pop(MODE_NAME, None)
@@ -413,9 +519,12 @@ def build_application(token: str):
         elif data == "mode:name":
             # show provinces to pick from
             provs = await asyncio.to_thread(list_provinces)
-            buttons = [
-                [InlineKeyboardButton(name, callback_data=f"prov:{code}")]
+            prov_buttons = [
+                InlineKeyboardButton(name, callback_data=f"prov:{code}")
                 for code, name in provs
+            ]
+            buttons = [
+                prov_buttons[i:i + 2] for i in range(0, len(prov_buttons), 2)
             ]
             buttons.append(
                 [InlineKeyboardButton("🌐 كل المحافظات", callback_data="prov:")]
@@ -441,7 +550,7 @@ def build_application(token: str):
         exam_no = (query.data or "res:").split("res:", 1)[1]
         d = await asyncio.to_thread(lookup_exam_no, exam_no)
         if d:
-            await query.message.reply_text(format_card(d), parse_mode=ParseMode.HTML)
+            await send_result_card(query.message, d)
         else:
             await query.message.reply_text("لم يتم العثور على النتيجة.")
 
@@ -488,7 +597,7 @@ def build_application(token: str):
             )
             return
         if total == 1 and results:
-            await message.reply_text(format_card(results[0]), parse_mode=ParseMode.HTML)
+            await send_result_card(message, results[0])
             return
         text = f"🔎 وجدت {total} نتيجة — اختر الاسم:"
         markup = _results_keyboard(results, offset, total)
@@ -520,15 +629,16 @@ def build_application(token: str):
         text = (update.effective_message.text or "").strip()
         if not text:
             return
+        if not await asyncio.to_thread(has_data):
+            await update.effective_message.reply_text(WAITING_MSG, parse_mode=ParseMode.HTML)
+            return
 
         # Auto-detect: a long digit string => exam number lookup.
         digits = text.replace(" ", "")
         if digits.isdigit() and len(digits) >= 5 and not context.user_data.get(MODE_NAME):
             d = await asyncio.to_thread(lookup_exam_no, digits)
             if d:
-                await update.effective_message.reply_text(
-                    format_card(d), parse_mode=ParseMode.HTML
-                )
+                await send_result_card(update.effective_message, d)
             else:
                 await update.effective_message.reply_text(
                     "❌ لا توجد نتيجة بهذا الرقم الامتحاني.\nتأكد من الرقم أو استخدم /start.",

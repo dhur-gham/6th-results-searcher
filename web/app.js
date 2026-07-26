@@ -221,6 +221,27 @@
     var pass = isPass(stu.result);
     var pill = el("span", "pill " + (pass ? "pass" : "fail"), stu.result || "غير معروف");
     top.appendChild(pill);
+
+    // download-as-PDF: browser print dialog ("Save as PDF") — no libraries,
+    // no server round-trip; @media print in styles.css shows just this card.
+    var actions = el("div", "rc-actions no-print");
+    var dlBtn = el("button", "rc-download");
+    dlBtn.type = "button";
+    dlBtn.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12m0 0 4-4m-4 4-4-4"/><path d="M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"/></svg>';
+    dlBtn.appendChild(el("span", null, "تحميل PDF"));
+    dlBtn.addEventListener("click", function () {
+      var prevTitle = document.title;
+      document.title = "نتيجة - " + (stu.name || stu.exam_no || "");
+      function restore() {
+        document.title = prevTitle;
+        window.removeEventListener("afterprint", restore);
+      }
+      window.addEventListener("afterprint", restore);
+      window.print();
+    });
+    actions.appendChild(dlBtn);
+    top.appendChild(actions);
+
     card.appendChild(top);
 
     // stats

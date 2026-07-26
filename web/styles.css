@@ -260,6 +260,16 @@ select{appearance:none;padding-inline-start:40px}
 .pill.pass{color:var(--pass);background:var(--pass-soft)}
 .pill.fail{color:var(--fail);background:var(--fail-soft)}
 
+.rc-actions{margin-top:14px}
+.rc-download{
+  display:inline-flex;align-items:center;gap:8px;
+  font-family:inherit;font-weight:700;font-size:.88rem;color:var(--primary);
+  background:var(--surface-2);border:1px solid var(--border);border-radius:999px;
+  padding:9px 16px;cursor:pointer;
+}
+.rc-download:hover{border-color:var(--primary)}
+.rc-download svg{width:16px;height:16px}
+
 .rc-stats{
   display:grid;grid-template-columns:1fr 1fr;gap:12px;
   padding:16px 18px;
@@ -358,6 +368,28 @@ body.modal-open{overflow:hidden}
 
 @media (max-width:360px){
   .rc-stats{grid-template-columns:1fr}
+}
+
+/* ===== Print / "Save as PDF" — only the open result card, plain B&W ===== */
+@media print{
+  :root{
+    --bg:#fff; --bg-grad-1:#fff; --bg-grad-2:#fff;
+    --surface:#fff; --surface-2:#fff; --border:#999;
+    --text:#000; --muted:#333;
+    --primary-soft:#fff; --pass-soft:#fff; --fail-soft:#fff;
+    --shadow:none; --shadow-sm:none;
+  }
+  html,body{background:#fff !important}
+  .bg-orbs,.hero,.search-card,.foot,.modal-back,.no-print,.rc-back,.output{display:none !important}
+  body.modal-open{overflow:visible}
+  .modal{position:static;inset:auto;background:#fff;display:block !important;overflow:visible;z-index:auto;animation:none}
+  .modal.open{animation:none}
+  .modal-inner{max-width:none;padding:0;margin:0;min-height:auto}
+  .result-card{box-shadow:none;border:1px solid #999;animation:none}
+  .stat.hero-stat{background:#fff !important;color:#000 !important;border:1px solid #999}
+  .stat.hero-stat .stat-label{color:#333 !important}
+  .pill{border:1px solid currentColor}
+  .grades-table td.gt-score.pass,.grades-table td.gt-score.fail,.grades-table td.gt-score.absent{background:#fff !important}
 }
 
 @media (prefers-reduced-motion: reduce){

@@ -62,6 +62,18 @@ app.add_middleware(
 )
 
 
+@app.middleware("http")
+async def _static_cache_headers(request, call_next):
+    """StaticFiles (web/) sets no Cache-Control of its own, so browsers fall
+    back to heuristic caching and can keep serving a stale app.js/styles.css
+    well after a frontend deploy. Apply the same CACHE_MODE policy already
+    used for API responses (see CACHE_HEADERS above)."""
+    response = await call_next(request)
+    if not request.url.path.startswith("/api/") and "cache-control" not in response.headers:
+        response.headers["Cache-Control"] = CACHE_HEADERS["Cache-Control"]
+    return response
+
+
 @app.on_event("startup")
 def _startup():
     init_db()
